@@ -1,0 +1,188 @@
+@use 'colors.scss' as *;
+
+#view-panel,
+#object-panel {
+    top: 50%;
+    transform: translate(0, -50%);
+    right: 102px;
+    width: 320px;
+    flex-direction: column;
+
+    &:not(.pcui-hidden) {
+        display: flex;
+    }
+
+    & > .view-panel-row {
+        display: flex;
+        flex-direction: row;
+        padding: 2px;
+        height: 28px;
+
+        & > .view-panel-row-label {
+            flex-grow: 1;
+        }
+
+        & > .view-panel-row-toggle {
+            background-color: $bcg-dark;
+
+            &::after {
+                background-color: $clr-default;
+            }
+
+            &.pcui-boolean-input-ticked {
+                background-color: $clr-hilight;
+
+                &::after {
+                    background-color: $clr-active;
+                }
+            }
+        }
+
+        & > .view-panel-row-slider {
+            margin: 0px;
+
+            & > .pcui-slider-container {
+                & > .pcui-slider-bar {
+                    & > .pcui-slider-handle {
+                        background-color: $clr-default;
+                        border-radius: 3px;
+                    }
+                }
+            }
+        }
+
+        & > .view-panel-row-pickers {
+            display: flex;
+            flex-direction: row;
+            margin: 2px 2px;
+            width: 185px;
+            justify-content: space-between;
+
+            & > .view-panel-row-picker {
+                margin: 0px 0px;
+                padding: 0px;
+                height: 24px;
+            }
+        }
+
+        & > .view-panel-row-select {
+            width: 187px;
+            margin: 0;
+        }
+    }
+
+    & > .view-panel-hint {
+        padding: 8px 8px 10px;
+        color: $text-secondary;
+        line-height: 1.4;
+    }
+}
+
+#object-panel {
+    & > .object-panel-section {
+        margin: 8px 2px 4px;
+        padding: 0 2px;
+        color: $clr-icon-hilight;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+    }
+
+    & > .object-panel-stats {
+        min-height: 26px;
+        margin: 0 2px 4px;
+        padding: 6px 8px;
+        background-color: $bcg-dark;
+        color: $text-primary;
+        line-height: 1.25;
+        overflow-wrap: anywhere;
+    }
+
+    .object-panel-pickers {
+        justify-content: flex-end;
+        gap: 8px;
+    }
+
+    & > .object-panel-action-row {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 4px;
+        padding: 4px 2px 2px;
+
+        & > .object-panel-action {
+            min-width: 0;
+            height: 26px;
+            padding: 6px 4px;
+            background-color: $bcg-dark;
+            color: $text-primary;
+            text-align: center;
+            cursor: pointer;
+
+            &:hover {
+                background-color: $bcg-light;
+            }
+
+            &.danger {
+                color: #ffb1a8;
+            }
+        }
+    }
+
+    & > .object-panel-mini-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 4px;
+        padding: 4px 2px;
+
+        & > .object-panel-mini-row {
+            display: flex;
+            min-width: 0;
+            height: 26px;
+            align-items: center;
+
+            & > .object-panel-mini-label {
+                width: 42px;
+                color: $text-secondary;
+            }
+
+            & > .object-panel-mini-slider {
+                flex: 1;
+                min-width: 0;
+                margin: 0;
+
+                & > .pcui-slider-container {
+                    & > .pcui-slider-bar {
+                        & > .pcui-slider-handle {
+                            background-color: $clr-default;
+                            border-radius: 3px;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    & > .object-panel-apply {
+        height: 28px;
+        margin: 4px 2px 0;
+        padding: 7px 8px;
+        background-color: $clr-hilight;
+        color: $clr-active;
+        text-align: center;
+        cursor: pointer;
+
+        &:hover {
+            background-color: $clr-icon-hilight;
+        }
+
+        &.secondary {
+            margin-top: 4px;
+            background-color: $bcg-dark;
+            color: $text-primary;
+
+            &:hover {
+                background-color: $bcg-light;
+            }
+        }
+    }
+}

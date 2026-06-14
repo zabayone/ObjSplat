@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>SuperSplat</title>
+        <meta charset="utf-8" />
+        <base href="__BASE_HREF__">
+        <link rel="manifest" href="./manifest.json">
+        <link id="app-stylesheet" rel="stylesheet" href="./index.css">
+        <link rel="shortcut icon" href="#">
+        <meta name="description" content="SuperSplat is an advanced browser-based editor for manipulating and optimizing 3D Gaussian Splats. It is open source and engine agnostic." />
+        <meta name="viewport" content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0" />
+
+        <!-- Service worker -->
+        <script>
+            const params = new URLSearchParams(window.location.search);
+            const cacheBust = params.get('cacheBust');
+            const localViewer = params.get('localViewer') === '1';
+
+            if (cacheBust || localViewer) {
+                const suffix = `?v=${encodeURIComponent(cacheBust || Date.now().toString())}`;
+                document.getElementById('app-stylesheet').href = `./index.css${suffix}`;
+            }
+
+            const sw = navigator.serviceWorker;
+            if (sw) {
+                if (localViewer) {
+                    sw.getRegistrations?.()
+                        .then(registrations => Promise.all(registrations.map(reg => reg.unregister())))
+                        .catch(err => console.log('failed to unregister service worker', err));
+                } else {
+                    sw.register('./sw.js')
+                        .then(reg => console.log('service worker registered', reg))
+                        .catch(err => console.log('failed to register service worker', err));
+                }
+            }
+        </script>
+    </head>
+
+    <body>
+        <script>
+            const script = document.createElement('script');
+            script.type = 'module';
+            script.src = `./index.js${cacheBust || localViewer ? `?v=${encodeURIComponent(cacheBust || Date.now().toString())}` : ''}`;
+            document.body.appendChild(script);
+        </script>
+    </body>
+</html>

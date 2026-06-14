@@ -1,0 +1,129 @@
+@use 'colors.scss' as *;
+
+#data-panel {
+    width: 100%;
+    height: 320px;
+    border-top: 1px solid $bcg-lighter;
+
+    &:not(.pcui-hidden) {
+        display: flex;
+    }
+}
+
+#data-panel-resize-handle {
+    position: absolute;
+    top: -4px;
+    left: 0;
+    right: 0;
+    height: 8px;
+    cursor: ns-resize;
+    z-index: 10;
+}
+
+#data-panel-popup-container {
+    position: absolute;
+    left: 50px;
+    top: 50px;
+}
+
+#data-panel-popup-label {
+    background-color: $bcg-dark;
+    color: $text-primary;
+}
+
+#data-controls-container {
+    width: 256px;
+    flex-grow: 0;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    background-color: $bcg-darker;
+    border-right: 1px solid $bcg-lighter;
+}
+
+#data-controls {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    flex-grow: 1;
+    background-color: $bcg-primary;
+}
+
+.data-panel-toggle-row {
+    height: 28px;
+    min-height: 28px;
+    flex-shrink: 0;
+    padding: 0px;
+    margin: 0 4px;
+    align-items: center;
+}
+
+.data-panel-toggle-label {
+    flex-grow: 1;
+}
+
+.data-panel-toggle {
+    flex-shrink: 0;
+    background-color: $bcg-dark;
+
+    &::after {
+        background-color: $clr-default;
+    }
+
+    &.pcui-boolean-input-ticked {
+        background-color: $clr-hilight;
+
+        &::after {
+            background-color: $clr-active;
+        }
+    }
+}
+
+#data-list-box {
+    overflow-y: auto;
+    flex-grow: 1;
+    margin: 8px;
+    background-color: $bcg-darker;
+    border-radius: 2px;
+    border: 1px solid $bcg-darkest;
+}
+
+.data-list-item {
+    padding: 4px 8px;
+    cursor: pointer;
+    color: $text-secondary;
+    font-size: 12px;
+    border-left: 3px solid transparent;
+
+    &:hover {
+        color: $text-primary;
+        background-color: $bcg-primary;
+    }
+
+    &.active {
+        font-weight: bold;
+        color: $clr-hilight;
+        background-color: $bcg-primary;
+        border-left-color: $clr-hilight;
+    }
+}
+
+#histogram-container {
+    flex-grow: 1;
+    flex-shrink: 1;
+}
+
+#histogram-canvas {
+    image-rendering: pixelated;
+}
+
+#histogram-svg {
+    pointer-events: none;
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    left: 0;
+}

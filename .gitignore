@@ -1,0 +1,106 @@
+# macOS and editor state
+.DS_Store
+.AppleDouble
+.LSOverride
+!.github/
+!.github/**
+.git.upstream-backup/
+.git.broken-backup
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments and local configuration
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+ENV/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Build artifacts
+build/
+dist/
+*.so
+*.dylib
+*.dll
+*.o
+*.obj
+*.a
+*.lib
+*.egg
+*.whl
+
+# Node / GUI build artifacts
+GUI/node_modules/
+GUI/dist/
+GUI/.parcel-cache/
+GUI/.rollup.cache/
+
+# Pipeline outputs and generated data
+outputs*/
+outputs_lgs/
+results/
+logs/
+layering/
+debug/
+
+# Model checkpoints and ML weights
+checkpoints/*
+!checkpoints/README.md
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+*.onnx
+*.bin
+
+# Large/generated numeric assets
+*.npy
+*.npz
+*.ply
+*.pcd
+*.las
+*.laz
+
+# Local media/data inputs
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.exr
+*.tiff
+
+# Third-party generated artifacts kept in vendored sources
+src/**/build/
+src/**/dist/
+src/**/__pycache__/
+src/Depth_Anything_V2/metric_depth/dataset/splits/
+src/Depth_Anything_V2/metric_depth/vis_pointcloud/
+submodules/**/build/
+submodules/**/dist/
+submodules/**/__pycache__/
+
+# Archived legacy workflows not needed for the default thesis pipeline
+legacy/
