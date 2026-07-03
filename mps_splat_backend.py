@@ -212,18 +212,23 @@ def extract_gaussian_params_from_ply(ply_path: str) -> Tuple[Dict[str, np.ndarra
 # Optimizer
 # ---------------------------------------------------------------------------
 
-def _build_optimizer(gaussians, mean_lr_scale: float = 1.0) -> torch.optim.Adam:
-    return torch.optim.Adam(
-        [
+def _build_optimizer(
+    gaussians,
+    mean_lr_scale: float = 1.0,
+    freeze_geometry: bool = False,
+    freeze_sh_coeffs: bool = False,
+) -> torch.optim.Adam:
+    param_groups = []
+    if not freeze_geometry:
+        param_groups.extend([
             {"params": [gaussians.means],      "lr": 0.00016 * float(mean_lr_scale)},
             {"params": [gaussians.scales],      "lr": 0.005},
             {"params": [gaussians.quaternions], "lr": 0.005},
-            {"params": [gaussians.opacities],   "lr": 0.05},
-            {"params": [gaussians.sh_coeffs],   "lr": 0.0025},
-        ],
-        lr=0.001,
-        eps=1e-15,
-    )
+        ])
+    param_groups.append({"params": [gaussians.opacities], "lr": 0.02 if freeze_geometry else 0.05})
+    if not freeze_sh_coeffs:
+        param_groups.append({"params": [gaussians.sh_coeffs], "lr": 0.0005 if freeze_geometry else 0.0025})
+    return torch.optim.Adam(param_groups, lr=0.001, eps=1e-15)
 
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1086,8 @@ def _train_torch_gs(
     lr_plateau_patience: Optional[int] = None,
     lr_plateau_factor: float = 0.5,
     lr_plateau_min_lr: float = 1e-6,
+    freeze_geometry: bool = False,
+    freeze_sh_coeffs: bool = False,
 ) -> str:
     _ensure_torch_gs_importable()
     from torch_gs.core.gaussians import init_gaussians_from_pcd
@@ -1119,9 +1126,10 @@ def _train_torch_gs(
     gaussians.opacities = torch.nn.Parameter(torch.full(
         (gaussians.opacities.shape[0], 1), _logit(opacity_init), dtype=torch.float32, device=device
     ))
-    gaussians.means.requires_grad = gaussians.scales.requires_grad = True
-    gaussians.quaternions.requires_grad = gaussians.opacities.requires_grad = True
-    gaussians.sh_coeffs.requires_grad = True
+    gaussians.means.requires_grad = gaussians.scales.requires_grad = not freeze_geometry
+    gaussians.quaternions.requires_grad = not freeze_geometry
+    gaussians.opacities.requires_grad = True
+    gaussians.sh_coeffs.requires_grad = not freeze_sh_coeffs
     gaussians._labels_np = labels if labels is not None else None
     gaussians._frozen_mask_np = (
         np.asarray(frozen_mask, dtype=bool).reshape(-1)
@@ -1135,7 +1143,12 @@ def _train_torch_gs(
         gaussians.opacities.data = torch.tensor(initial_gaussian_params["opacities"], dtype=torch.float32, device=device)
         gaussians.sh_coeffs.data = torch.tensor(initial_gaussian_params["sh_coeffs"], dtype=torch.float32, device=device)
 
-    optimizer = _build_optimizer(gaussians, mean_lr_scale=mean_lr_scale)
+    optimizer = _build_optimizer(
+        gaussians,
+        mean_lr_scale=mean_lr_scale,
+        freeze_geometry=freeze_geometry,
+        freeze_sh_coeffs=freeze_sh_coeffs,
+    )
 
     best_loss = float("inf")
     no_improve = 0
@@ -1175,10 +1188,16 @@ def _train_torch_gs(
                     gaussians, prune_threshold=max(prune_threshold, 0.05),
                     clone_fraction=0.0, min_points=512, max_points=prune_to,
                 )
-                gaussians.means.requires_grad = gaussians.scales.requires_grad = True
-                gaussians.quaternions.requires_grad = gaussians.opacities.requires_grad = True
-                gaussians.sh_coeffs.requires_grad = True
-                optimizer = _build_optimizer(gaussians, mean_lr_scale=mean_lr_scale)
+                gaussians.means.requires_grad = gaussians.scales.requires_grad = not freeze_geometry
+                gaussians.quaternions.requires_grad = not freeze_geometry
+                gaussians.opacities.requires_grad = True
+                gaussians.sh_coeffs.requires_grad = not freeze_sh_coeffs
+                optimizer = _build_optimizer(
+                    gaussians,
+                    mean_lr_scale=mean_lr_scale,
+                    freeze_geometry=freeze_geometry,
+                    freeze_sh_coeffs=freeze_sh_coeffs,
+                )
                 continue
             raise
 
@@ -1220,9 +1239,15 @@ def _train_torch_gs(
             gaussians.opacities.data[:] = torch.full(
                 (gaussians.opacities.shape[0], 1), _logit(opacity_init), dtype=torch.float32, device=device
             )
+            optimizer = _build_optimizer(
+                gaussians,
+                mean_lr_scale=mean_lr_scale,
+                freeze_geometry=freeze_geometry,
+                freeze_sh_coeffs=freeze_sh_coeffs,
+            )
             print(f"[splat-apple] iter={i} opacity reset", flush=True)
 
-        if scale_log_min is not None or scale_log_max is not None:
+        if not freeze_geometry and (scale_log_min is not None or scale_log_max is not None):
             with torch.no_grad():
                 gaussians.scales.data = torch.clamp(
                     gaussians.scales.data,
@@ -1239,10 +1264,16 @@ def _train_torch_gs(
                 max_points=max_points,
                 grad_scores=grad_scores_np,
             )
-            gaussians.means.requires_grad = gaussians.scales.requires_grad = True
-            gaussians.quaternions.requires_grad = gaussians.opacities.requires_grad = True
-            gaussians.sh_coeffs.requires_grad = True
-            optimizer = _build_optimizer(gaussians, mean_lr_scale=mean_lr_scale)
+            gaussians.means.requires_grad = gaussians.scales.requires_grad = not freeze_geometry
+            gaussians.quaternions.requires_grad = not freeze_geometry
+            gaussians.opacities.requires_grad = True
+            gaussians.sh_coeffs.requires_grad = not freeze_sh_coeffs
+            optimizer = _build_optimizer(
+                gaussians,
+                mean_lr_scale=mean_lr_scale,
+                freeze_geometry=freeze_geometry,
+                freeze_sh_coeffs=freeze_sh_coeffs,
+            )
             grad_accum = torch.zeros(gaussians.means.shape, device=device)
             grad_count = 0
 
@@ -1250,18 +1281,19 @@ def _train_torch_gs(
     # Preserve original scene scale (torch branch) to avoid training-driven
     # shrinking/expansion that produces tiny gaussians. Adjust means and
     # log-scales consistently if necessary.
-    try:
-        final_means = gaussians.means.detach().cpu().numpy()
-        final_scene_scale = max(float(np.linalg.norm(np.std(final_means, axis=0))), 1e-6)
-        scale_correction = init_scene_scale / final_scene_scale
-        if not np.isfinite(scale_correction) or scale_correction <= 0.0:
-            scale_correction = 1.0
-        if scale_correction != 1.0:
-            with torch.no_grad():
-                gaussians.means.data = gaussians.means.data * float(scale_correction)
-                gaussians.scales.data = gaussians.scales.data + float(np.log(float(scale_correction)))
-    except Exception:
-        pass
+    if not freeze_geometry:
+        try:
+            final_means = gaussians.means.detach().cpu().numpy()
+            final_scene_scale = max(float(np.linalg.norm(np.std(final_means, axis=0))), 1e-6)
+            scale_correction = init_scene_scale / final_scene_scale
+            if not np.isfinite(scale_correction) or scale_correction <= 0.0:
+                scale_correction = 1.0
+            if scale_correction != 1.0:
+                with torch.no_grad():
+                    gaussians.means.data = gaussians.means.data * float(scale_correction)
+                    gaussians.scales.data = gaussians.scales.data + float(np.log(float(scale_correction)))
+        except Exception:
+            pass
 
     _save_layerpano_compatible_ply(out_ply_path, gaussians, labels_np=labels_out, sh_degree=3)
     return out_ply_path
@@ -1297,6 +1329,7 @@ def _train_mlx(
     lr_plateau_patience: Optional[int] = None,
     lr_plateau_factor: float = 0.5,
     lr_plateau_min_lr: float = 1e-6,
+    freeze_geometry: bool = False,
     freeze_sh_coeffs: bool = False,
 ) -> str:
     _ensure_mlx_gs_importable()
@@ -1363,14 +1396,16 @@ def _train_mlx(
             labels = np.asarray(initial_gaussian_labels, dtype=np.int32).reshape(-1)
 
     def make_optimizers(lr_mult: float = 1.0):
-        optimizers = {
-            "means":       optim.Adam(learning_rate=(0.00016 * float(mean_lr_scale) * float(lr_mult))),
-            "scales":      optim.Adam(learning_rate=(0.0015 * float(lr_mult))),
-            "quaternions": optim.Adam(learning_rate=(0.005 * float(lr_mult))),
-            "opacities":   optim.Adam(learning_rate=(0.05 * float(lr_mult))),
-        }
+        optimizers = {}
+        if not freeze_geometry:
+            optimizers.update({
+                "means":       optim.Adam(learning_rate=(0.00016 * float(mean_lr_scale) * float(lr_mult))),
+                "scales":      optim.Adam(learning_rate=(0.0015 * float(lr_mult))),
+                "quaternions": optim.Adam(learning_rate=(0.005 * float(lr_mult))),
+            })
+        optimizers["opacities"] = optim.Adam(learning_rate=((0.015 if freeze_geometry else 0.05) * float(lr_mult)))
         if not freeze_sh_coeffs:
-            optimizers["sh_coeffs"] = optim.Adam(learning_rate=(0.0025 * float(lr_mult)))
+            optimizers["sh_coeffs"] = optim.Adam(learning_rate=((0.0005 if freeze_geometry else 0.0025) * float(lr_mult)))
         return optimizers
 
     current_lr_mult = 1.0
@@ -1453,7 +1488,7 @@ def _train_mlx(
             optimizers = make_optimizers()
             print(f"[splat-apple-mlx] iter={i} opacity reset", flush=True)
 
-        if scale_log_min is not None or scale_log_max is not None:
+        if not freeze_geometry and (scale_log_min is not None or scale_log_max is not None):
             params["scales"] = mx.clip(params["scales"], scale_log_min, scale_log_max)
 
         # Densify only during the first 60% of iterations.
@@ -1474,16 +1509,17 @@ def _train_mlx(
             optimizers = make_optimizers()
 
     # Preserve the original point cloud scale to avoid MLX shrinking/expanding the scene.
-    final_means = np.asarray(params["means"], dtype=np.float32)
-    final_scene_scale = max(float(np.linalg.norm(np.std(final_means, axis=0))), 1e-6)
-    scale_correction = init_scene_scale / final_scene_scale
-    if not np.isfinite(scale_correction) or scale_correction <= 0.0:
-        scale_correction = 1.0
+    if not freeze_geometry:
+        final_means = np.asarray(params["means"], dtype=np.float32)
+        final_scene_scale = max(float(np.linalg.norm(np.std(final_means, axis=0))), 1e-6)
+        scale_correction = init_scene_scale / final_scene_scale
+        if not np.isfinite(scale_correction) or scale_correction <= 0.0:
+            scale_correction = 1.0
 
-    params["means"] = params["means"] * float(scale_correction)
-    if scale_correction != 1.0:
-        params["scales"] = params["scales"] + mx.log(mx.array(float(scale_correction), dtype=mx.float32))
-    params["scales"] = mx.clip(params["scales"], scale_log_min, scale_log_max)
+        params["means"] = params["means"] * float(scale_correction)
+        if scale_correction != 1.0:
+            params["scales"] = params["scales"] + mx.log(mx.array(float(scale_correction), dtype=mx.float32))
+        params["scales"] = mx.clip(params["scales"], scale_log_min, scale_log_max)
 
     final_params = {k: np.asarray(v, dtype=np.float32) for k, v in params.items()}
     if small_object_layer and "opacities" in final_params:
@@ -1534,6 +1570,7 @@ def train_with_splat_apple(
     lr_plateau_patience: Optional[int] = None,
     lr_plateau_factor: float = 0.5,
     lr_plateau_min_lr: float = 1e-6,
+    freeze_geometry: bool = False,
     freeze_sh_coeffs: bool = False,
 ) -> str:
     """
@@ -1546,6 +1583,10 @@ def train_with_splat_apple(
         prev_gaussian_params: Optional gaussian parameters from previous layer (for ray-matching transfer)
         prev_gaussian_labels: Optional labels from previous layer gaussians
     """
+    unlimited_points = max_points is not None and int(max_points) <= 0
+    if unlimited_points:
+        max_points = None
+
     # Transfer frozen gaussians from previous layer if available
     traindata["frozen_mask"] = np.zeros((len(traindata.get("pcd_points", [])),), dtype=bool)
 
@@ -1580,10 +1621,10 @@ def train_with_splat_apple(
         scale_log_max,
     )
 
-    if max_points is None and training_profile in ("per_layer", "deva_instances"):
+    if max_points is None and not unlimited_points and training_profile in ("per_layer", "deva_instances"):
         max_points = 3_000_000
 
-    if training_backend == "mlx":
+    if training_backend == "mlx" and not freeze_geometry:
         # MLX is very fast, but needs stricter scale control than torch_gs.
         # PLY scale_* fields are log-scales; values near 0 become unit-sized splats.
         mlx_scale_cap = -0.6 if training_profile == "final_fill" else -0.8
@@ -1622,6 +1663,7 @@ def train_with_splat_apple(
             lr_plateau_factor=lr_plateau_factor,
             lr_plateau_min_lr=lr_plateau_min_lr,
             freeze_sh_coeffs=freeze_sh_coeffs,
+            freeze_geometry=freeze_geometry,
         )
     else:
         return _train_torch_gs(
@@ -1649,6 +1691,8 @@ def train_with_splat_apple(
             lr_plateau_patience=lr_plateau_patience,
             lr_plateau_factor=lr_plateau_factor,
             lr_plateau_min_lr=lr_plateau_min_lr,
+            freeze_geometry=freeze_geometry,
+            freeze_sh_coeffs=freeze_sh_coeffs,
         )
 
 
@@ -1673,6 +1717,8 @@ def merge_ply_layers(
 ) -> str:
     if not ply_paths:
         raise ValueError("No PLY paths provided")
+    if max_points is not None and int(max_points) <= 0:
+        max_points = None
 
     base_vertex = PlyData.read(ply_paths[0])["vertex"].data
     base_dtype = base_vertex.dtype
@@ -1763,12 +1809,19 @@ def global_refine_after_merge(
         adaptive=adaptive,
         densify_interval=180,
         prune_threshold=0.01,
-        clone_fraction=0.04,
+        clone_fraction=0.0,
         max_points=max_points,
         downsample_ratio=downsample_ratio,
-        repulsion_weight=repulsion_weight,
-        training_profile="final_fill",
+        repulsion_weight=0.0,
+        mean_lr_scale=0.0,
+        training_profile=None,
         initial_gaussian_params=params,
         initial_gaussian_labels=labels,
-        freeze_sh_coeffs=True,
+        opacity_reg_weight=0.0,
+        opacity_mean_reg_weight=0.0,
+        blur_reg_weight=0.0,
+        scale_log_min=-20.0,
+        scale_log_max=20.0,
+        freeze_geometry=True,
+        freeze_sh_coeffs=False,
     )

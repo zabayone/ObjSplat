@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
 PY="${PY:-/opt/anaconda3/envs/layerpano3d/bin/python}"
-OUT_DIR="${OUT_DIR:-outputs_lgs}"
+OUT_DIR="${OUT_DIR:-outputs_park}"
 RGB_PATH="$OUT_DIR/rgb.png"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
@@ -33,7 +33,9 @@ DEVICE="${DEVICE:-mps}"
 N_VIEWS="${N_VIEWS:-12}"
 PHI_BANDS="${PHI_BANDS:-80,67.5,45,0,-45,-67.5,-80}"
 
-GROUNDING_PROMPTS="${GROUNDING_PROMPTS:-sky . road . pavement . grass . leaves . tree . bush . person . plant}"
+# GROUNDING_PROMPTS="${GROUNDING_PROMPTS:-sky . road . pavement . grass . leaves . tree . bush . person . plant}"
+# GROUNDING_PROMPTS="${GROUNDING_PROMPTS:-sky . mountain . person . table . bench . building . railing . house . snow . rock}"
+GROUNDING_PROMPTS="${GROUNDING_PROMPTS:-sky . road . pavement . grass . leaves . tree . bush . plant . stairway . fence . monument . lightpole}"
 GROUNDING_BOX_THRESHOLD="${GROUNDING_BOX_THRESHOLD:-0.18}"
 GROUNDING_TEXT_THRESHOLD="${GROUNDING_TEXT_THRESHOLD:-0.15}"
 GROUNDING_MASK_MIN_AREA="${GROUNDING_MASK_MIN_AREA:-500}"
@@ -61,14 +63,14 @@ QUALITY="${QUALITY:-standard}"
 MPS_TRAINING_BACKEND="${MPS_TRAINING_BACKEND:-mlx}"
 MPS_RASTERIZER="${MPS_RASTERIZER:-cpp}"
 
-MAX_POINTS="${MAX_POINTS:-3000000}"
+MAX_POINTS="${MAX_POINTS:-0}"
 DOWNSAMPLE_RATIO="${DOWNSAMPLE_RATIO:-1.0}"
 MEAN_LR_SCALE="${MEAN_LR_SCALE:-0.35}"
 REPULSION_WEIGHT="${REPULSION_WEIGHT:-5e-5}"
 
 MERGE_VOXEL_SIZE="${MERGE_VOXEL_SIZE:-0}"
 MERGE_MIN_OPACITY="${MERGE_MIN_OPACITY:--20}"
-MERGE_MAX_POINTS="${MERGE_MAX_POINTS:-6000000}"
+MERGE_MAX_POINTS="${MERGE_MAX_POINTS:-0}"
 
 GLOBAL_REFINE_ITERS="${GLOBAL_REFINE_ITERS:-300}"
 EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-0}"
@@ -106,7 +108,6 @@ LR_PLATEAU_MIN_LR="${LR_PLATEAU_MIN_LR:-1e-6}"
   --sam_checkpoint "$SAM_CHECKPOINT" \
   --sam_variant "$SAM_VARIANT" \
   --sam2_checkpoint "$SAM2_CHECKPOINT" \
-  --use_full_scene_background \
   --quality "$QUALITY" \
   --mps_training_backend "$MPS_TRAINING_BACKEND" \
   --mps_rasterizer "$MPS_RASTERIZER" \

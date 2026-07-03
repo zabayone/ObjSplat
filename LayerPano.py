@@ -110,6 +110,13 @@ def _fill_labels_by_nearest_neighbor(points: np.ndarray, labels: Optional[np.nda
     return lab
 
 
+def _is_nonempty_training_image(image, min_nonzero_ratio: float = 1e-5) -> bool:
+    arr = np.asarray(image.convert("RGB") if hasattr(image, "convert") else image)
+    if arr.size == 0:
+        return False
+    return float(np.count_nonzero(arr)) / float(arr.size) > float(min_nonzero_ratio)
+
+
 
 class LayerPano:
     def __init__(self, save_dir=None, backend="legacy", mps_rasterizer="cpp", quality="standard", mps_training_backend="mlx", max_points=None, downsample_ratio=0.1, disable_transfer=False, no_adaptive=False, repulsion_weight=1e-4, mean_lr_scale=1.0, mode="standard", early_stop_patience=None, early_stop_min_delta=0.0, lr_plateau_patience=None, lr_plateau_factor=0.5, lr_plateau_min_lr=1e-6):
@@ -697,15 +704,16 @@ class LayerPano:
 
 
         assert pcd_points.shape[0] == pcd_masks.shape[0]
-        pretrain_cap = int(self.max_points) if self.max_points is not None else 6000000
-        pretrain_cap = max(pretrain_cap, 2500000)
-        if len(pcd_points) > pretrain_cap:
-            ratio = len(pcd_points) // pretrain_cap + 1
-            print('Warning: PointCloud is too large {}, downsampling by ratio of {}'.format(len(pcd_points),ratio))
-            pcd_points = pcd_points[::ratio]
-            pcd_colors = pcd_colors[::ratio]
-            pcd_masks = pcd_masks[::ratio]
-            pcd_labels = pcd_labels[::ratio]
+        pretrain_cap = int(self.max_points) if self.max_points is not None and int(self.max_points) > 0 else None
+        if pretrain_cap is not None:
+            pretrain_cap = max(pretrain_cap, 2500000)
+            if len(pcd_points) > pretrain_cap:
+                ratio = len(pcd_points) // pretrain_cap + 1
+                print('Warning: PointCloud is too large {}, downsampling by ratio of {}'.format(len(pcd_points),ratio))
+                pcd_points = pcd_points[::ratio]
+                pcd_colors = pcd_colors[::ratio]
+                pcd_masks = pcd_masks[::ratio]
+                pcd_labels = pcd_labels[::ratio]
 
         if 0.0 < self.downsample_ratio < 1.0 and len(pcd_points) > 0:
             target = max(1, int(round(len(pcd_points) * self.downsample_ratio)))
@@ -748,6 +756,9 @@ class LayerPano:
             if not os.path.exists(rgb_path) or not os.path.exists(pose_path):
                 continue
             pers_rgb = Image.open(rgb_path)
+            if not _is_nonempty_training_image(pers_rgb):
+                print(f"[INFO] Layer {idx}: skipping empty frame {fname}")
+                continue
             pose_gs = np.load(pose_path)
             frames.append({'image': pers_rgb, 'transform_matrix': pose_gs})
 

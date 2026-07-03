@@ -9,6 +9,9 @@ import os
 import shutil
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
+
 from LayerPano import LayerPano
 from gen_layerdata_from_deva import generate_layers_from_deva
 from mps_splat_backend import merge_ply_layers, global_refine_after_merge
@@ -50,6 +53,38 @@ def _clear_existing_layer_outputs(save_root: Path) -> None:
         shutil.rmtree(deva_instances_dir)
 
 
+def _numeric_suffix_key(path: Path) -> tuple[int, str]:
+    stem = path.stem
+    digits = ""
+    for ch in reversed(stem):
+        if ch.isdigit():
+            digits = ch + digits
+        else:
+            break
+    return (int(digits) if digits else -1, stem)
+
+
+def _load_full_scene_refine_frames(input_root: Path) -> list[dict]:
+    frames_dir = input_root / "traindata" / "deva_frames" / "frames"
+    frame_paths = sorted(frames_dir.glob("rgb_*.png"), key=_numeric_suffix_key)
+    frames = []
+    for rgb_path in frame_paths:
+        idx, _stem = _numeric_suffix_key(rgb_path)
+        pose_path = frames_dir / f"transform_matrix_{idx}.npy"
+        if idx < 0 or not pose_path.exists():
+            continue
+        frames.append({
+            "image": Image.open(rgb_path).convert("RGB"),
+            "transform_matrix": np.load(pose_path),
+        })
+    if not frames:
+        raise RuntimeError(
+            f"No full-scene refine frames found in {frames_dir}. "
+            "Refine must use unmasked RGB views, not per-layer masked frames."
+        )
+    return frames
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Object-aware layered 3DGS training pipeline")
     parser.add_argument("--input_dir", required=True, help="Input directory (e.g. outputs_lgs)")
@@ -75,7 +110,8 @@ def main() -> None:
     parser.add_argument("--mps_rasterizer", type=str, default="cpp", choices=["python", "cpp"])
     parser.add_argument("--mps_training_backend", type=str, default="mlx", choices=["auto", "torch", "mlx"])
     parser.add_argument("--quality", type=str, default="standard", choices=["standard", "high", "ultra", "test"])
-    parser.add_argument("--max_points", type=int, default=3_000_000)
+    parser.add_argument("--max_points", type=int, default=0,
+                        help="Per-layer gaussian cap; <=0 disables the explicit cap")
     parser.add_argument("--downsample_ratio", type=float, default=1.0)
     parser.add_argument("--repulsion_weight", type=float, default=1e-4)
     parser.add_argument("--mean_lr_scale", type=float, default=0.2)
@@ -87,8 +123,9 @@ def main() -> None:
     parser.add_argument("--lr_plateau_min_lr", type=float, default=1e-6)
 
     parser.add_argument("--merge_voxel_size", type=float, default=0.0)
-    parser.add_argument("--merge_min_opacity", type=float, default=0.0)
-    parser.add_argument("--merge_max_points", type=int, default=6_000_000)
+    parser.add_argument("--merge_min_opacity", type=float, default=-20.0)
+    parser.add_argument("--merge_max_points", type=int, default=0,
+                        help="Merged-scene gaussian cap; <=0 disables the cap")
     parser.add_argument("--merged_out", default=None)
 
     parser.add_argument("--global_refine_iters", type=int, default=300)
@@ -237,12 +274,14 @@ def main() -> None:
     if merged_out is None:
         merged_out = os.path.join(save_scene, "gsplat_scene_merged.ply")
 
+    merge_max_points = args.merge_max_points if args.merge_max_points and args.merge_max_points > 0 else None
+
     merge_ply_layers(
         ply_paths,
         merged_out,
         voxel_size=args.merge_voxel_size,
         min_opacity=args.merge_min_opacity,
-        max_points=args.merge_max_points,
+        max_points=merge_max_points,
     )
 
     if args.global_refine_iters and args.global_refine_iters > 0:
@@ -260,7 +299,19 @@ def main() -> None:
         if layer_idx is None:
             raise RuntimeError("Could not resolve a layer for global refinement")
 
-        traindata = layerpano.load_all_pcd_and_perspectives(os.path.join(args.input_dir, "traindata"))
+        refine_frames = _load_full_scene_refine_frames(Path(args.input_dir))
+        first_w, first_h = refine_frames[0]["image"].size
+        traindata = {
+            "fov": 90,
+            "W": int(first_w),
+            "H": int(first_h),
+            "pcd_points": np.zeros((1, 3), dtype=np.float32),
+            "pcd_colors": np.zeros((1, 3), dtype=np.float32),
+            "pcd_masks": np.ones((1, 3), dtype=np.float32),
+            "pcd_labels": np.zeros((1,), dtype=np.int32),
+            "frames": refine_frames,
+        }
+        print(f"[pipeline] Global refine using {len(refine_frames)} full-scene frames.")
         refined_out = os.path.splitext(merged_out)[0] + "_refined.ply"
         global_refine_after_merge(
             traindata=traindata,
@@ -271,7 +322,7 @@ def main() -> None:
             device=args.device,
             training_backend=args.mps_training_backend,
             adaptive=False,
-            max_points=args.merge_max_points,
+            max_points=merge_max_points,
             downsample_ratio=args.downsample_ratio,
             repulsion_weight=args.repulsion_weight,
         )

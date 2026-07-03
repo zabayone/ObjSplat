@@ -197,6 +197,10 @@ def _resize_mask_to_shape(mask: np.ndarray, shape_hw: Tuple[int, int]) -> np.nda
     return cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
 
 
+def _mask_has_training_content(mask: np.ndarray, min_pixels: int = 1) -> bool:
+    return int(np.asarray(mask, dtype=bool).sum()) >= int(min_pixels)
+
+
 def _project_erp_mask_to_frame(
     erp_mask: np.ndarray,
     frame_idx: int,
@@ -545,6 +549,220 @@ def _normalize_group_label(label: Optional[str], fallback: str) -> str:
         "leaf": "leaves",
     }
     return aliases.get(tokens[0], tokens[0])
+
+
+def _group_is_semantic(group: dict, names: set[str]) -> bool:
+    label = str(group.get("group_label", "")).strip().lower()
+    tokens = {part for part in label.replace("/", " ").replace("-", " ").replace("_", " ").split() if part}
+    return label in names or bool(tokens & names)
+
+
+def _nearest_layer_for_component(
+    layer_map: np.ndarray,
+    component_mask: np.ndarray,
+    exclude_layers: Optional[set[int]] = None,
+    max_radius: int = 96,
+    min_fraction: float = 0.0,
+) -> Optional[int]:
+    exclude_layers = exclude_layers or set()
+    comp = np.asarray(component_mask, dtype=bool)
+    if not comp.any():
+        return None
+
+    h, w = comp.shape
+    max_radius = max(3, min(int(max_radius), max(h, w)))
+    for radius in (3, 5, 9, 15, 25, 41, 65, max_radius):
+        kernel = np.ones((radius, radius), np.uint8)
+        dilated = cv2.dilate(comp.astype(np.uint8), kernel, iterations=1).astype(bool)
+        ring = dilated & (~comp)
+        neighbor_values = layer_map[ring]
+        neighbor_values = neighbor_values[neighbor_values >= 0]
+        if exclude_layers:
+            neighbor_values = np.array([v for v in neighbor_values.tolist() if int(v) not in exclude_layers], dtype=np.int32)
+        if neighbor_values.size:
+            values, counts = np.unique(neighbor_values.astype(np.int32), return_counts=True)
+            best_idx = int(np.argmax(counts))
+            if float(counts[best_idx]) / float(max(1, int(counts.sum()))) < float(min_fraction):
+                return None
+            return int(values[best_idx])
+    return None
+
+
+def _fill_unassigned_by_nearest_layer(layer_map: np.ndarray) -> Tuple[np.ndarray, int]:
+    out = np.asarray(layer_map, dtype=np.int32).copy()
+    unknown = out < 0
+    if not unknown.any() or not (out >= 0).any():
+        return out, 0
+
+    n_labels, cc = cv2.connectedComponents(unknown.astype(np.uint8), connectivity=8)
+    filled_pixels = 0
+    for comp_idx in range(1, n_labels):
+        comp = cc == comp_idx
+        target = _nearest_layer_for_component(out, comp)
+        if target is None:
+            continue
+        out[comp] = int(target)
+        filled_pixels += int(comp.sum())
+    return out, filled_pixels
+
+
+def _nearest_instance_for_component(
+    label_map: np.ndarray,
+    component_mask: np.ndarray,
+    allowed_ids: np.ndarray,
+    max_radius: int = 128,
+) -> Optional[int]:
+    comp = np.asarray(component_mask, dtype=bool)
+    if not comp.any():
+        return None
+    allowed = set(int(x) for x in np.asarray(allowed_ids, dtype=np.int32).tolist())
+    if not allowed:
+        return None
+
+    h, w = comp.shape
+    max_radius = max(3, min(int(max_radius), max(h, w)))
+    for radius in (3, 5, 9, 15, 25, 41, 65, 97, max_radius):
+        kernel = np.ones((radius, radius), np.uint8)
+        dilated = cv2.dilate(comp.astype(np.uint8), kernel, iterations=1).astype(bool)
+        ring = dilated & (~comp)
+        neighbor_values = label_map[ring]
+        neighbor_values = np.array([v for v in neighbor_values.tolist() if int(v) in allowed], dtype=np.int32)
+        if neighbor_values.size:
+            values, counts = np.unique(neighbor_values, return_counts=True)
+            return int(values[int(np.argmax(counts))])
+    return None
+
+
+def _labels_from_consolidated_layer_map(
+    original_labels: np.ndarray,
+    layer_map: np.ndarray,
+    layer_groups: List[dict],
+) -> np.ndarray:
+    labels_out = np.zeros_like(original_labels, dtype=np.int32)
+    for layer_idx, group in enumerate(layer_groups):
+        group_ids = np.array(group["instance_ids"], dtype=np.int32)
+        target_mask = layer_map == int(layer_idx)
+        if not target_mask.any():
+            continue
+
+        keep_original = target_mask & np.isin(original_labels, group_ids)
+        labels_out[keep_original] = original_labels[keep_original]
+
+        needs_label = target_mask & (~keep_original)
+        if not needs_label.any():
+            continue
+
+        fallback_id = int(group_ids[0])
+        n_labels, cc = cv2.connectedComponents(needs_label.astype(np.uint8), connectivity=8)
+        for comp_idx in range(1, n_labels):
+            comp = cc == comp_idx
+            inst_id = _nearest_instance_for_component(original_labels, comp, group_ids)
+            labels_out[comp] = int(inst_id if inst_id is not None else fallback_id)
+
+    return labels_out
+
+
+def _consolidate_layer_label_map(
+    labels_2d: np.ndarray,
+    layer_groups: List[dict],
+    pano_rgb: np.ndarray,
+) -> Tuple[np.ndarray, dict]:
+    """Make layer assignment dense and remove obvious semantic/fragment errors."""
+    h, w = labels_2d.shape[:2]
+    layer_map = np.full((h, w), -1, dtype=np.int32)
+    for layer_idx, group in enumerate(layer_groups):
+        ids = np.array(group["instance_ids"], dtype=np.int32)
+        layer_map[np.isin(labels_2d, ids)] = int(layer_idx)
+
+    cleanup = {
+        "sky_pruned_pixels": 0,
+        "small_component_reassigned_pixels": 0,
+        "residual_reassigned_pixels": 0,
+    }
+
+    sky_layers = {
+        idx for idx, group in enumerate(layer_groups)
+        if _group_is_semantic(group, {"sky"})
+    }
+    if sky_layers:
+        horizon_cutoff = int(round(h * 0.62))
+        upper_anchor = int(round(h * 0.20))
+        for sky_idx in sorted(sky_layers):
+            sky_mask = layer_map == sky_idx
+            if not sky_mask.any():
+                continue
+
+            remove = np.zeros_like(sky_mask, dtype=bool)
+            remove[horizon_cutoff:, :] |= sky_mask[horizon_cutoff:, :]
+
+            n_labels, cc, stats, centroids = cv2.connectedComponentsWithStats(sky_mask.astype(np.uint8), connectivity=8)
+            for comp_idx in range(1, n_labels):
+                y_top = int(stats[comp_idx, cv2.CC_STAT_TOP])
+                centroid_y = float(centroids[comp_idx][1])
+                if y_top > upper_anchor and centroid_y > h * 0.48:
+                    remove |= cc == comp_idx
+
+            if remove.any():
+                n_rm, rm_cc = cv2.connectedComponents(remove.astype(np.uint8), connectivity=8)
+                for comp_idx in range(1, n_rm):
+                    comp = rm_cc == comp_idx
+                    target = _nearest_layer_for_component(layer_map, comp, exclude_layers={sky_idx}, min_fraction=0.30)
+                    if target is None:
+                        layer_map[comp] = -1
+                    else:
+                        layer_map[comp] = int(target)
+                    cleanup["sky_pruned_pixels"] += int(comp.sum())
+
+    total_pixels = int(h * w)
+    small_abs = max(256, min(6000, int(round(total_pixels * 0.0008))))
+    for layer_idx in range(len(layer_groups)):
+        mask = layer_map == layer_idx
+        layer_area = int(mask.sum())
+        if layer_area <= 0:
+            continue
+        rel_limit = max(1, int(round(layer_area * 0.025)))
+        area_limit = max(small_abs, rel_limit)
+        n_labels, cc, stats, _centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+        if n_labels <= 1:
+            continue
+        largest_comp_idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        for comp_idx in range(1, n_labels):
+            if comp_idx == largest_comp_idx:
+                continue
+            area = int(stats[comp_idx, cv2.CC_STAT_AREA])
+            if area > area_limit:
+                continue
+            comp = cc == comp_idx
+            target = _nearest_layer_for_component(layer_map, comp, exclude_layers={layer_idx}, min_fraction=0.60)
+            if target is None:
+                continue
+            layer_map[comp] = int(target)
+            cleanup["small_component_reassigned_pixels"] += area
+
+    layer_map, filled = _fill_unassigned_by_nearest_layer(layer_map)
+    cleanup["residual_reassigned_pixels"] = int(filled)
+
+    if (layer_map < 0).any() and (layer_map >= 0).any():
+        # Last resort for rare isolated pixels: iteratively grow assigned labels.
+        for _ in range(max(h, w)):
+            unknown = layer_map < 0
+            if not unknown.any():
+                break
+            changed = False
+            for layer_idx in range(len(layer_groups)):
+                mask = layer_map == layer_idx
+                if not mask.any():
+                    continue
+                grown = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1).astype(bool)
+                claim = grown & unknown
+                if claim.any():
+                    layer_map[claim] = int(layer_idx)
+                    cleanup["residual_reassigned_pixels"] += int(claim.sum())
+                    changed = True
+            if not changed:
+                break
+
+    return layer_map, cleanup
 
 
 def _masked_rgb(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -909,6 +1127,15 @@ def generate_layers_from_deva(
         for inst_id in group["instance_ids"]:
             instance_to_layer[int(inst_id)] = int(layer_idx)
 
+    layer_map_2d, cleanup_stats = _consolidate_layer_label_map(labels_2d, layer_groups, pano_rgb)
+    labels_2d = _labels_from_consolidated_layer_map(labels_2d, layer_map_2d, layer_groups)
+    labels_3d = labels_2d.reshape(-1).astype(np.int32)
+    for inst_id, stat in raw_stats.items():
+        stat.points_3d = int((labels_3d == int(inst_id)).sum())
+
+    cleanup_summary = ", ".join(f"{k}={v}" for k, v in cleanup_stats.items())
+    print(f"[LayerData] Segmentation cleanup: {cleanup_summary}")
+
     print(
         f"[LayerData] Writing {len(layer_groups)} training layers "
         f"from {len(selected_ids)} instances"
@@ -952,6 +1179,8 @@ def generate_layers_from_deva(
             if frame_mask is None:
                 frame_mask = np.isin(fmap, group_ids)
             frame_mask = _resize_mask_to_shape(frame_mask, rgb.shape[:2])
+            if not _mask_has_training_content(frame_mask):
+                continue
             Image.fromarray(_masked_rgb(rgb, frame_mask)).save(frames_out / f"rgb_{frame_idx}.png")
             np.save(frames_out / f"transform_matrix_{frame_idx}.npy", np.load(pose_path))
 
@@ -965,9 +1194,6 @@ def generate_layers_from_deva(
     background_layer_idx = None
     if add_background:
         background_layer_idx = len(layer_groups)
-        layer_dir = save_path / "traindata" / f"layer{background_layer_idx}"
-        frames_out = layer_dir / "frames"
-        _ensure_dir(frames_out)
 
         if effective_full_scene_background:
             # Full-scene background keeps all points and all valid panorama pixels.
@@ -982,42 +1208,51 @@ def generate_layers_from_deva(
             # Background labels are zero for background points
             bg_labels_full = np.zeros_like(labels_3d, dtype=np.int32)
 
-        bg_xyz = xyz[bg_point_mask]
-        bg_rgb = colors[bg_point_mask]
-        bg_labels = bg_labels_full[bg_point_mask]
+        if not bg_point_mask.any():
+            background_layer_idx = None
+        else:
+            layer_dir = save_path / "traindata" / f"layer{background_layer_idx}"
+            frames_out = layer_dir / "frames"
+            _ensure_dir(frames_out)
 
-        _write_point_ply(layer_dir / f"pcd_rgb_layer{background_layer_idx}.ply", bg_xyz, bg_rgb, labels=bg_labels)
-        _write_point_ply(
-            layer_dir / f"pcd_mask_layer{background_layer_idx}.ply",
-            bg_xyz,
-            np.full_like(bg_rgb, 255, dtype=np.uint8),
-            labels=bg_labels,
-        )
+            bg_xyz = xyz[bg_point_mask]
+            bg_rgb = colors[bg_point_mask]
+            bg_labels = bg_labels_full[bg_point_mask]
 
-        for frame_idx, fmap in instance_maps.items():
-            rgb_path = frames_path / f"rgb_{frame_idx}.png"
-            pose_path = frames_path / f"transform_matrix_{frame_idx}.npy"
-            if not rgb_path.exists() or not pose_path.exists():
-                continue
-            rgb = np.array(Image.open(rgb_path).convert("RGB"), dtype=np.uint8)
-            bg_mask = _project_erp_mask_to_frame(
-                bg_erp_mask,
-                int(frame_idx),
-                rgb.shape[0],
-                rgb.shape[1],
-                n=n_views,
-                phi_bands=phi_bands,
+            _write_point_ply(layer_dir / f"pcd_rgb_layer{background_layer_idx}.ply", bg_xyz, bg_rgb, labels=bg_labels)
+            _write_point_ply(
+                layer_dir / f"pcd_mask_layer{background_layer_idx}.ply",
+                bg_xyz,
+                np.full_like(bg_rgb, 255, dtype=np.uint8),
+                labels=bg_labels,
             )
 
-            if bg_mask is None:
-                frame_union = np.isin(fmap, np.array(selected_ids, dtype=np.int32))
-                bg_mask = np.ones_like(frame_union, dtype=bool) if effective_full_scene_background else ~frame_union
-            bg_mask = _resize_mask_to_shape(bg_mask, rgb.shape[:2])
-            Image.fromarray(_masked_rgb(rgb, bg_mask)).save(frames_out / f"rgb_{frame_idx}.png")
-            np.save(frames_out / f"transform_matrix_{frame_idx}.npy", np.load(pose_path))
+            for frame_idx, fmap in instance_maps.items():
+                rgb_path = frames_path / f"rgb_{frame_idx}.png"
+                pose_path = frames_path / f"transform_matrix_{frame_idx}.npy"
+                if not rgb_path.exists() or not pose_path.exists():
+                    continue
+                rgb = np.array(Image.open(rgb_path).convert("RGB"), dtype=np.uint8)
+                bg_mask = _project_erp_mask_to_frame(
+                    bg_erp_mask,
+                    int(frame_idx),
+                    rgb.shape[0],
+                    rgb.shape[1],
+                    n=n_views,
+                    phi_bands=phi_bands,
+                )
 
-        _save_erp_outputs(layer_dir, pano_rgb, bg_erp_mask, f"layer{background_layer_idx}")
-        overlay_masks.append((background_layer_idx, bg_erp_mask))
+                if bg_mask is None:
+                    frame_union = np.isin(fmap, np.array(selected_ids, dtype=np.int32))
+                    bg_mask = np.ones_like(frame_union, dtype=bool) if effective_full_scene_background else ~frame_union
+                bg_mask = _resize_mask_to_shape(bg_mask, rgb.shape[:2])
+                if not _mask_has_training_content(bg_mask):
+                    continue
+                Image.fromarray(_masked_rgb(rgb, bg_mask)).save(frames_out / f"rgb_{frame_idx}.png")
+                np.save(frames_out / f"transform_matrix_{frame_idx}.npy", np.load(pose_path))
+
+            _save_erp_outputs(layer_dir, pano_rgb, bg_erp_mask, f"layer{background_layer_idx}")
+            overlay_masks.append((background_layer_idx, bg_erp_mask))
 
     residual_layer_idx = None
     # If we used non-full background (uncovered points were assigned to background),
@@ -1028,7 +1263,7 @@ def generate_layers_from_deva(
         residual_mask_3d = ~selected_union_3d
 
     if residual_mask_3d.any():
-        residual_layer_idx = (background_layer_idx + 1) if background_layer_idx is not None else len(selected_ids)
+        residual_layer_idx = (background_layer_idx + 1) if background_layer_idx is not None else len(layer_groups)
         layer_dir = save_path / "traindata" / f"layer{residual_layer_idx}"
         frames_out = layer_dir / "frames"
         _ensure_dir(frames_out)
@@ -1067,6 +1302,8 @@ def generate_layers_from_deva(
             if residual_frame_mask is None:
                 residual_frame_mask = ~np.isin(fmap, selected_ids_np)
             residual_frame_mask = _resize_mask_to_shape(residual_frame_mask, rgb.shape[:2])
+            if not _mask_has_training_content(residual_frame_mask):
+                continue
             Image.fromarray(_masked_rgb(rgb, residual_frame_mask)).save(frames_out / f"rgb_{frame_idx}.png")
             np.save(frames_out / f"transform_matrix_{frame_idx}.npy", np.load(pose_path))
 
@@ -1123,6 +1360,7 @@ def generate_layers_from_deva(
             "morph_open_kernel": int(grounding_morph_open_kernel),
             "detections": grounding_detections,
         },
+        "segmentation_cleanup": cleanup_stats,
         "background_layer_idx": background_layer_idx,
         "residual_layer_idx": residual_layer_idx,
         "final_refine_layer_idx": final_refine_layer_idx,
