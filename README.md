@@ -16,8 +16,6 @@ The current workflow is optimized for local development on macOS / Apple Silicon
 7. Train each layer as a 3D Gaussian Splatting scene.
 8. Merge layer PLY files and optionally run a final global refinement pass.
 
-The older DEVA + SAM frame-propagation path is still available, but the default thesis pipeline is GroundingDINO + SAM/SAM2 first.
-
 ## Quick Start
 
 Prepare the environment and checkpoints, then place your panorama at:
@@ -26,7 +24,7 @@ Prepare the environment and checkpoints, then place your panorama at:
 outputs_lgs/rgb.png
 ```
 
-Run the full default park-scene pipeline:
+Run the full pipeline:
 
 ```bash
 ./run_from_pano.sh
@@ -71,7 +69,7 @@ Most defaults can be overridden through environment variables before running `ru
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GROUNDING_PROMPTS` | park classes | Semantic classes detected by GroundingDINO. |
+| `GROUNDING_PROMPTS` | default classes (listed above) | Semantic classes detected by GroundingDINO. |
 | `GROUNDING_BOX_THRESHOLD` | `0.18` | Lower values keep more detections. |
 | `GROUNDING_TEXT_THRESHOLD` | `0.15` | Lower values accept weaker text matches. |
 | `GROUNDING_MASK_MIN_AREA` | `500` | Minimum SAM mask area in pixels. |
@@ -91,7 +89,6 @@ Expected checkpoint paths are:
 - `checkpoints/SAM 2.1 Hiera Large.pt`
 - `checkpoints/sam_vit_h_4b8939.pth`
 - `checkpoints/groundingdino_swinb_cogvlm.pth`
-- `checkpoints/DEVA-propagation.pth` for the optional DEVA path
 
 The exact model files are not committed to the repository.
 
