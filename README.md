@@ -17,6 +17,14 @@ The active workflow targets macOS / Apple Silicon and uses the MLX Splat-Apple b
 
 ## Quick Start
 
+Prepare the environment and checkpoints, then place your panorama at:
+
+```bash
+outputs_lgs/rgb.png
+```
+
+Run the full pipeline:
+
 ```bash
 ./run_from_pano.sh
 ```
@@ -54,8 +62,8 @@ Most defaults can be overridden through environment variables before running `ru
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `OUT_DIR` | `outputs_park` | Output folder containing `rgb.png`. |
-| `GROUNDING_PROMPTS` | park classes | Semantic classes detected by GroundingDINO. |
+| `GROUNDING_PROMPTS` | default classes (listed above) | Semantic classes detected by GroundingDINO. |
+
 | `GROUNDING_BOX_THRESHOLD` | `0.18` | Lower values keep more detections. |
 | `GROUNDING_TEXT_THRESHOLD` | `0.15` | Lower values accept weaker text matches. |
 | `GROUNDING_MASK_MIN_AREA` | `500` | Minimum SAM mask area in pixels. |
@@ -78,6 +86,7 @@ Expected checkpoint paths are:
 - `checkpoints/sam_vit_h_4b8939.pth`
 - `checkpoints/groundingdino_swinb_cogvlm.pth`
 - `checkpoints/depth_anything_v2_vitl.pth`
+
 
 The exact model files are not committed to the repository.
 
