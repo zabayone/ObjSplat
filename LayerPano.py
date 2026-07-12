@@ -119,7 +119,7 @@ def _is_nonempty_training_image(image, min_nonzero_ratio: float = 1e-5) -> bool:
 
 
 class LayerPano:
-    def __init__(self, save_dir=None, backend="legacy", mps_rasterizer="cpp", quality="standard", mps_training_backend="mlx", max_points=None, downsample_ratio=0.1, disable_transfer=False, no_adaptive=False, repulsion_weight=1e-4, mean_lr_scale=1.0, mode="standard", early_stop_patience=None, early_stop_min_delta=0.0, lr_plateau_patience=None, lr_plateau_factor=0.5, lr_plateau_min_lr=1e-6):
+    def __init__(self, save_dir=None, backend="legacy", mps_rasterizer="cpp", quality="standard", max_points=None, downsample_ratio=0.1, disable_transfer=False, no_adaptive=False, repulsion_weight=1e-4, mean_lr_scale=1.0, mode="standard", early_stop_patience=None, early_stop_min_delta=0.0, lr_plateau_patience=None, lr_plateau_factor=0.5, lr_plateau_min_lr=1e-6):
         self.init_logger()
         self.save_dir = save_dir
         self.opt = GSParams()
@@ -127,7 +127,6 @@ class LayerPano:
         self.hyper = ModelHiddenParams()
         self.backend = backend
         self.mps_rasterizer = mps_rasterizer
-        self.mps_training_backend = mps_training_backend
         self.quality = quality
         self.max_points = max_points
         self.downsample_ratio = downsample_ratio
@@ -223,7 +222,7 @@ class LayerPano:
             if self.backend == "splat-apple":
                 if not HAS_SPLAT_APPLE_BACKEND:
                     raise RuntimeError(
-                        "splat-apple backend is not available. Install splat-apple dependencies (torch_gs/mlx_gs)."
+                        "splat-apple MLX backend is not available. Install mlx_gs dependencies."
                     )
                 outfile = self.save_ply(
                     os.path.join(self.save_dir, f'gsplat_layer{layer_idx}.ply'),
@@ -235,7 +234,6 @@ class LayerPano:
                     num_iterations=n_iterations,
                     rasterizer=self.mps_rasterizer,
                     device=self.device,
-                    training_backend=self.mps_training_backend,
                     adaptive=(not self.no_adaptive),
                     max_points=self.max_points,
                     downsample_ratio=self.downsample_ratio,
@@ -275,8 +273,8 @@ class LayerPano:
 
         return outfile
 
-    def _read_deva_instances_metadata(self, input_dir):
-        meta_path = os.path.join(input_dir, "traindata", "deva_instances.json")
+    def _read_layer_instances_metadata(self, input_dir):
+        meta_path = os.path.join(input_dir, "traindata", "layer_instances.json")
         if not os.path.exists(meta_path):
             return None
         try:
@@ -284,10 +282,10 @@ class LayerPano:
             with open(meta_path, "r", encoding="utf-8") as fh:
                 return json.load(fh)
         except Exception as exc:
-            print(f"[WARN] Failed to read deva_instances.json: {exc}")
+            print(f"[WARN] Failed to read layer_instances.json: {exc}")
             return None
 
-    def create_deva_instances(self, input_dir, outlier_thresh, metadata_path=None, background_last=True):
+    def create_layer_instances(self, input_dir, outlier_thresh, metadata_path=None, background_last=True):
         input_dir = os.path.join(input_dir, "traindata")
         self.outlier_thresh = outlier_thresh
 
@@ -300,7 +298,7 @@ class LayerPano:
             except Exception as exc:
                 print(f"[WARN] Failed to read metadata: {exc}")
         if meta is None:
-            meta = self._read_deva_instances_metadata(os.path.dirname(input_dir))
+            meta = self._read_layer_instances_metadata(os.path.dirname(input_dir))
 
         layer_order = []
         background_idx = None
@@ -337,7 +335,7 @@ class LayerPano:
         if not layer_order:
             layer_order = list(range(self.count_layer(input_dir)))
 
-        print("DEVA instance layers:", layer_order)
+        print("Instance layers:", layer_order)
 
         quality_iteration_scale = {
             "standard": 1.0,
@@ -362,7 +360,7 @@ class LayerPano:
             if self.backend == "splat-apple":
                 if not HAS_SPLAT_APPLE_BACKEND:
                     raise RuntimeError(
-                        "splat-apple backend is not available. Install splat-apple dependencies (torch_gs/mlx_gs)."
+                        "splat-apple MLX backend is not available. Install mlx_gs dependencies."
                     )
                 outfile = self.save_ply(
                     os.path.join(self.save_dir, f"gsplat_layer{layer_idx}.ply"),
@@ -374,7 +372,6 @@ class LayerPano:
                     num_iterations=n_iterations,
                     rasterizer=self.mps_rasterizer,
                     device=self.device,
-                    training_backend=self.mps_training_backend,
                     adaptive=(not self.no_adaptive),
                     max_points=self.max_points,
                     downsample_ratio=self.downsample_ratio,
@@ -387,13 +384,12 @@ class LayerPano:
                     lr_plateau_min_lr=self.lr_plateau_min_lr,
                     prev_gaussian_params=None,
                     prev_gaussian_labels=None,
-                    training_profile="deva_instances",
+                    training_profile="layer_instances",
                 )
                 output_paths.append(outfile)
                 continue
 
-            # Legacy backend not supported for DEVA instance mode.
-            raise RuntimeError("DEVA instance mode requires splat-apple backend")
+            raise RuntimeError("Instance layer mode requires the splat-apple MLX backend")
 
         return output_paths
     

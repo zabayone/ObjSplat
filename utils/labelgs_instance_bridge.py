@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Bridge between labelgs_preprocess instance labels and training point clouds.
+"""Bridge between optional instance-label maps and training point clouds.
 
 This module provides a robust loader that projects 3D points into the
-equirectangular instance map produced by the preprocess step and returns
+    equirectangular instance map produced by external tooling and returns
 per-point instance ids.
 """
 
@@ -28,12 +28,8 @@ def _find_path(save_dir: str, layer_idx: int) -> Optional[str]:
 
 def _find_3d_labels_path(save_dir: str, layer_idx: int) -> Optional[str]:
     candidates = [
-        os.path.join(save_dir, "preprocess", "labelgs", "instances", f"layer{layer_idx}_labels_3d.npy"),
         os.path.join(save_dir, "instances", f"layer{layer_idx}_labels_3d.npy"),
         os.path.join(save_dir, f"layer{layer_idx}_labels_3d.npy"),
-        os.path.join(save_dir, "preprocess", "labelgs", "instances", f"layer{layer_idx}_instance_labels_deva_3d.npy"),
-        os.path.join(save_dir, "instances", f"layer{layer_idx}_instance_labels_deva_3d.npy"),
-        os.path.join(save_dir, f"layer{layer_idx}_instance_labels_deva_3d.npy"),
     ]
     for p in candidates:
         if os.path.exists(p):

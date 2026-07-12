@@ -15,15 +15,20 @@ if [[ ! -f "$RGB_PATH" ]]; then
   exit 1
 fi
 
-echo "[1/3] Cleaning $OUT_DIR while preserving rgb.png"
-shopt -s dotglob nullglob
-for path in "$OUT_DIR"/*; do
-  if [[ "$(basename "$path")" == "rgb.png" ]]; then
-    continue
-  fi
-  rm -rf -- "$path"
-done
-shopt -u dotglob nullglob
+CLEAN_OUTPUT="${CLEAN_OUTPUT:-1}"
+if [[ "$CLEAN_OUTPUT" != "0" ]]; then
+  echo "[1/3] Cleaning $OUT_DIR while preserving rgb.png"
+  shopt -s dotglob nullglob
+  for path in "$OUT_DIR"/*; do
+    if [[ "$(basename "$path")" == "rgb.png" ]]; then
+      continue
+    fi
+    rm -rf -- "$path"
+  done
+  shopt -u dotglob nullglob
+else
+  echo "[1/3] Reusing existing $OUT_DIR artifacts"
+fi
 
 echo "[2/3] Generating Grounding-SAM object-aware traindata"
 
@@ -56,11 +61,15 @@ SAM_VARIANT="${SAM_VARIANT:-sam2}"
 SAM2_CHECKPOINT="${SAM2_CHECKPOINT:-checkpoints/SAM 2.1 Hiera Large.pt}"
 SAM_CHECKPOINT="${SAM_CHECKPOINT:-checkpoints/sam_vit_h_4b8939.pth}"
 GROUNDING_DINO_CHECKPOINT="${GROUNDING_DINO_CHECKPOINT:-checkpoints/groundingdino_swinb_cogvlm.pth}"
+FORCE_RESEGMENT="${FORCE_RESEGMENT:-1}"
+SEGMENT_ARGS=()
+if [[ "$FORCE_RESEGMENT" != "0" ]]; then
+  SEGMENT_ARGS+=(--force_resegment)
+fi
 
 echo "[3/3] Training and merging standard-quality 3DGS scene"
 
 QUALITY="${QUALITY:-standard}"
-MPS_TRAINING_BACKEND="${MPS_TRAINING_BACKEND:-mlx}"
 MPS_RASTERIZER="${MPS_RASTERIZER:-cpp}"
 
 MAX_POINTS="${MAX_POINTS:-0}"
@@ -72,17 +81,17 @@ MERGE_VOXEL_SIZE="${MERGE_VOXEL_SIZE:-0}"
 MERGE_MIN_OPACITY="${MERGE_MIN_OPACITY:--20}"
 MERGE_MAX_POINTS="${MERGE_MAX_POINTS:-0}"
 
-GLOBAL_REFINE_ITERS="${GLOBAL_REFINE_ITERS:-300}"
+GLOBAL_REFINE_ITERS="${GLOBAL_REFINE_ITERS:-120}"
 EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-0}"
 EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-0.0}"
 LR_PLATEAU_PATIENCE="${LR_PLATEAU_PATIENCE:-0}"
 LR_PLATEAU_FACTOR="${LR_PLATEAU_FACTOR:-0.5}"
 LR_PLATEAU_MIN_LR="${LR_PLATEAU_MIN_LR:-1e-6}"
 
-"$PY" run_layered_deva_pipeline.py \
+"$PY" run_objsplat_pipeline.py \
   --input_dir "$OUT_DIR" \
   --save_dir "$OUT_DIR" \
-  --force_resegment \
+  "${SEGMENT_ARGS[@]}" \
   --device "$DEVICE" \
   --depth_scale "$DEPTH_SCALE" \
   --min_frame_area "$MIN_FRAME_AREA" \
@@ -93,7 +102,6 @@ LR_PLATEAU_MIN_LR="${LR_PLATEAU_MIN_LR:-1e-6}"
   --phi_bands "$PHI_BANDS" \
   --equirect_min_votes "$EQUIRECT_MIN_VOTES" \
   --equirect_kernel_size "$EQUIRECT_KERNEL_SIZE" \
-  --grounding_first \
   --use_grounding_dino \
   --grounding_dino_checkpoint "$GROUNDING_DINO_CHECKPOINT" \
   --grounding_prompts "$GROUNDING_PROMPTS" \
@@ -109,7 +117,6 @@ LR_PLATEAU_MIN_LR="${LR_PLATEAU_MIN_LR:-1e-6}"
   --sam_variant "$SAM_VARIANT" \
   --sam2_checkpoint "$SAM2_CHECKPOINT" \
   --quality "$QUALITY" \
-  --mps_training_backend "$MPS_TRAINING_BACKEND" \
   --mps_rasterizer "$MPS_RASTERIZER" \
   --max_points "$MAX_POINTS" \
   --downsample_ratio "$DOWNSAMPLE_RATIO" \

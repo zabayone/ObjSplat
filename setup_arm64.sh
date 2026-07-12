@@ -1,11 +1,11 @@
 #!/bin/bash
-# Full LayerPano3D setup for macOS ARM64 (Apple Silicon)
+# ObjSplat setup for macOS ARM64 (Apple Silicon)
 # This script installs the required dependencies for the MPS workflow.
 
 set -e  # Exit on error
 
 echo "=========================================="
-echo "LayerPano3D Setup for macOS ARM64"
+echo "ObjSplat Setup for macOS ARM64"
 echo "=========================================="
 
 # 1. Remove old environment if it exists
@@ -44,12 +44,12 @@ echo "Setup completed!"
 echo "=========================================="
 echo ""
 echo "Next steps:"
-echo "1. Download checkpoints (see README/SETUP_ARM64.md):"
-echo "   - Panorama LoRA"
-echo "   - Lama"
-echo "   - SAM model"
-echo "   - Depth-Anything-V2"
-echo "   - Infusion"
+echo "1. Download checkpoints (see README.md):"
+echo "   - SAM 2.1 Hiera Large"
+echo "   - SAM ViT-H"
+echo "   - GroundingDINO"
+echo "   - Depth Anything V2"
+echo "   - ControlNetLama (optional)"
 echo ""
 echo "2. To validate the setup:"
 echo "   conda activate layerpano3d"
@@ -57,6 +57,6 @@ echo "   python -c \"import torch; print(f'PyTorch: {torch.__version__}')\""
 echo ""
 echo "3. Login to Hugging Face and run:"
 echo "   huggingface-cli login"
-echo "   bash run_from_pano_deva.sh"
+echo "   bash run_from_pano.sh"
 echo ""
 echo "Legacy one-shot scripts are archived in ./legacy/"
