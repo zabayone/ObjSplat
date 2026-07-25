@@ -3,7 +3,9 @@
 import math
 import os
 import random
+import re
 import sys
+import tempfile
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -30,9 +32,24 @@ def _pose_to_w2c(pose: np.ndarray) -> np.ndarray:
     return w2c.astype(np.float32)
 
 
-def _estimate_log_scales(points: np.ndarray) -> np.ndarray:
+def _estimate_log_scales(
+    points: np.ndarray,
+    erp_height: Optional[int] = None,
+    exact_limit: int = 500_000,
+) -> np.ndarray:
     if points.shape[0] < 2:
         return np.full((points.shape[0], 3), -4.0, dtype=np.float32)
+    if points.shape[0] > int(exact_limit):
+        radius = np.linalg.norm(points, axis=1).astype(np.float32)
+        if erp_height is not None and int(erp_height) > 0:
+            angular_step = float(np.pi / int(erp_height))
+        else:
+            angular_step = float(np.sqrt(4.0 * np.pi / points.shape[0]))
+        # One ERP sample subtends approximately radius * angular_step.
+        # This preserves angular coverage without an O(N log N) KD-tree build.
+        nn = np.maximum(radius * angular_step * 0.55, 1e-4)
+        log_scale = np.log(nn).astype(np.float32)
+        return np.repeat(log_scale[:, None], 3, axis=1)
     try:
         from scipy.spatial import cKDTree
         tree = cKDTree(points)
@@ -582,13 +599,28 @@ def _build_training_batch_mlx(traindata: Dict, downsample_ratio: float = 1.0):
     cx   = width  / 2.0
     cy   = height / 2.0
 
-    cameras, targets = [], []
+    cameras, targets, target_masks = [], [], []
     for frame in traindata["frames"]:
         w2c = _pose_to_w2c(np.array(frame["transform_matrix"], dtype=np.float32))
         cameras.append(Camera(W=width, H=height, fx=fx, fy=fy, cx=cx, cy=cy,
                                W2C=mx.array(w2c, dtype=mx.float32)))
         rgb = np.array(frame["image"].convert("RGB"), dtype=np.float32) / 255.0
         targets.append(mx.array(rgb, dtype=mx.float32))
+        frame_mask = frame.get("mask")
+        if frame_mask is None:
+            mask = np.ones((rgb.shape[0], rgb.shape[1], 1), dtype=np.float32)
+        else:
+            mask = np.array(frame_mask.convert("L"), dtype=np.float32) / 255.0
+            if mask.shape != rgb.shape[:2]:
+                from PIL import Image
+                mask = np.asarray(
+                    Image.fromarray(mask).resize(
+                        (rgb.shape[1], rgb.shape[0]), Image.Resampling.NEAREST
+                    ),
+                    dtype=np.float32,
+                )
+            mask = np.clip(mask, 0.0, 1.0)[..., None]
+        target_masks.append(mx.array(mask, dtype=mx.float32))
 
     xyz    = np.asarray(traindata["pcd_points"], dtype=np.float32)
     rgb    = np.asarray(traindata["pcd_colors"], dtype=np.float32)
@@ -607,7 +639,7 @@ def _build_training_batch_mlx(traindata: Dict, downsample_ratio: float = 1.0):
     if rgb.max() > 1.0:
         rgb = rgb / 255.0
     rgb = np.clip(rgb, 0.0, 1.0)
-    return xyz, rgb, labels, frozen_mask, cameras, targets
+    return xyz, rgb, labels, frozen_mask, cameras, targets, target_masks
 
 def _fill_labels_by_nearest_neighbor(points: np.ndarray, labels: Optional[np.ndarray]) -> Optional[np.ndarray]:
     if labels is None:
@@ -741,6 +773,7 @@ def _train_mlx(
     prune_threshold: float,
     clone_fraction: float,
     max_points: Optional[int],
+    unlimited_points: bool,
     downsample_ratio: float,
     repulsion_weight: float,
     mean_lr_scale: float = 1.0,
@@ -769,7 +802,15 @@ def _train_mlx(
     from mlx_gs.core.gaussians import init_gaussians_from_pcd
     from mlx_gs.training.trainer import train_step
 
-    xyz, rgb, labels, frozen_mask, cameras, targets = _build_training_batch_mlx(traindata, downsample_ratio)
+    (
+        xyz,
+        rgb,
+        labels,
+        frozen_mask,
+        cameras,
+        targets,
+        target_masks,
+    ) = _build_training_batch_mlx(traindata, downsample_ratio)
 
     if initial_gaussian_params is not None:
         init_xyz = np.asarray(initial_gaussian_params.get("means"), dtype=np.float32)
@@ -804,29 +845,30 @@ def _train_mlx(
         blur_reg_weight = 0.0
 
     init_scene_scale = max(float(np.linalg.norm(np.std(xyz, axis=0))), 1e-3)
-    scale_init = _estimate_log_scales(xyz)
-    scale_init = np.clip(scale_init, scale_log_min, scale_log_max)
-
-    gaussians = init_gaussians_from_pcd(
-        np.asarray(xyz, dtype=np.float32),
-        np.asarray(rgb, dtype=np.float32),
-        sh_degree=3,
-        scale_init=scale_init,
-        opacity_init=opacity_init,
-    )
-
-    params = {
-        "means":       gaussians.means,
-        "scales":      gaussians.scales,
-        "quaternions": gaussians.quaternions,
-        "opacities":   gaussians.opacities,
-        "sh_coeffs":   gaussians.sh_coeffs,
-    }
-
     if initial_gaussian_params is not None:
         params = {k: mx.array(v, dtype=mx.float32) for k, v in initial_gaussian_params.items()}
         if labels is None and initial_gaussian_labels is not None:
             labels = np.asarray(initial_gaussian_labels, dtype=np.int32).reshape(-1)
+    else:
+        scale_init = _estimate_log_scales(
+            xyz,
+            erp_height=traindata.get("erp_height"),
+        )
+        scale_init = np.clip(scale_init, scale_log_min, scale_log_max)
+        gaussians = init_gaussians_from_pcd(
+            np.asarray(xyz, dtype=np.float32),
+            np.asarray(rgb, dtype=np.float32),
+            sh_degree=3,
+            scale_init=scale_init,
+            opacity_init=opacity_init,
+        )
+        params = {
+            "means":       gaussians.means,
+            "scales":      gaussians.scales,
+            "quaternions": gaussians.quaternions,
+            "opacities":   gaussians.opacities,
+            "sh_coeffs":   gaussians.sh_coeffs,
+        }
     initial_opacities_np = None
     if preserve_initial_opacity_floor:
         initial_opacities_np = np.asarray(params["opacities"], dtype=np.float32).copy()
@@ -856,7 +898,7 @@ def _train_mlx(
     current_lr_mult = 1.0
     optimizers = make_optimizers(current_lr_mult)
     max_points_cap = int(os.environ.get("SPLAT_MLX_MAX_POINTS_CAP", "0") or "0")
-    if max_points is None:
+    if max_points is None and not unlimited_points:
         init_points = int(gaussians.means.shape[0])
         growth = float(os.environ.get("SPLAT_DENSIFY_GROWTH", "1.10") or "1.10")
         growth = max(1.0, growth)
@@ -865,12 +907,16 @@ def _train_mlx(
             max_points = int(min(max_points_cap, max_points))
         densify_interval = max(densify_interval, 200)
         clone_fraction = min(clone_fraction, 0.02)
-    else:
+    elif max_points is not None:
         max_points = int(max_points)
     if max_points_cap > 0:
-        max_points = int(min(max_points, max_points_cap))
+        max_points = (
+            int(max_points_cap)
+            if max_points is None
+            else int(min(max_points, max_points_cap))
+        )
     print(
-        f"[splat-apple-mlx] init_points={int(gaussians.means.shape[0])} "
+        f"[splat-apple-mlx] init_points={int(params['means'].shape[0])} "
         f"max_points={max_points} cap={max_points_cap or 'none'} "
         f"min_retain={topology_min_points}",
         flush=True,
@@ -890,9 +936,18 @@ def _train_mlx(
 
     for i in progress:
         cam_idx = random.randint(0, len(cameras) - 1)
-        active_sh_degree = 0 if i < max(1, num_iterations // 4) else 1
+        progress_fraction = float(i) / float(max(1, num_iterations))
+        if progress_fraction < 0.15:
+            active_sh_degree = 0
+        elif progress_fraction < 0.40:
+            active_sh_degree = 1
+        elif progress_fraction < 0.70:
+            active_sh_degree = 2
+        else:
+            active_sh_degree = 3
         loss, _, psnr, _ = train_step(
             params, optimizers, targets[cam_idx], cameras[cam_idx],
+            target_mask=target_masks[cam_idx],
             lambda_ssim=0.25, rasterizer_type=rasterizer,
             scale_reg_weight=max(opacity_reg_weight * 1.5, 0.01),
             opacity_reg_weight=opacity_reg_weight,
@@ -1115,6 +1170,7 @@ def train_with_splat_apple(
         prune_threshold=prune_threshold,
         clone_fraction=clone_fraction,
         max_points=max_points,
+        unlimited_points=unlimited_points,
         downsample_ratio=downsample_ratio,
         repulsion_weight=repulsion_weight,
         mean_lr_scale=mean_lr_scale,
@@ -1150,17 +1206,123 @@ def _coerce_vertex_dtype(vertex: np.ndarray, dtype) -> np.ndarray:
     return coerced
 
 
+def _stream_merge_ply_layers(
+    ply_paths: List[str],
+    out_path: str,
+    min_opacity: Optional[float],
+    chunk_size: int = 500_000,
+) -> str:
+    """Merge compatible binary Gaussian PLYs without concatenating them in RAM."""
+    datasets = [PlyData.read(path, mmap="r") for path in ply_paths]
+    first = datasets[0]
+    if first.text or len(first.elements) != 1 or first.elements[0].name != "vertex":
+        raise ValueError("streaming merge requires binary vertex-only PLYs")
+    dtype = first["vertex"].data.dtype
+    for dataset in datasets[1:]:
+        if (
+            dataset.text
+            or len(dataset.elements) != 1
+            or dataset.elements[0].name != "vertex"
+            or dataset["vertex"].data.dtype != dtype
+        ):
+            raise ValueError("streaming merge requires identical binary PLY schemas")
+
+    def valid_mask(vertex_chunk: np.ndarray) -> np.ndarray:
+        valid = (
+            np.isfinite(vertex_chunk["x"])
+            & np.isfinite(vertex_chunk["y"])
+            & np.isfinite(vertex_chunk["z"])
+        )
+        if "opacity" in (vertex_chunk.dtype.names or ()):
+            valid &= np.isfinite(vertex_chunk["opacity"])
+            if min_opacity is not None:
+                valid &= vertex_chunk["opacity"] >= float(min_opacity)
+        return valid
+
+    total = 0
+    for dataset in datasets:
+        vertex = dataset["vertex"].data
+        for start in range(0, len(vertex), int(chunk_size)):
+            total += int(valid_mask(vertex[start : start + int(chunk_size)]).sum())
+    if total <= 0:
+        raise ValueError("No finite Gaussian records remained after merge filtering")
+
+    with open(ply_paths[0], "rb") as source:
+        header_parts = []
+        while True:
+            line = source.readline()
+            if not line:
+                raise ValueError("Invalid PLY header")
+            header_parts.append(line)
+            if line.strip() == b"end_header":
+                break
+    header = b"".join(header_parts)
+    header, replacements = re.subn(
+        rb"(?m)^element vertex [0-9]+[ \t]*\r?$",
+        f"element vertex {total}".encode("ascii"),
+        header,
+        count=1,
+    )
+    if replacements != 1:
+        raise ValueError("Could not update PLY vertex count")
+    if not header.endswith(b"\n"):
+        header += b"\n"
+
+    output = os.path.abspath(out_path)
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{os.path.basename(output)}.", suffix=".tmp",
+        dir=os.path.dirname(output),
+    )
+    os.close(fd)
+    try:
+        with open(tmp_name, "wb", buffering=16 * 1024 * 1024) as stream:
+            stream.write(header)
+            for dataset in datasets:
+                vertex = dataset["vertex"].data
+                for start in range(0, len(vertex), int(chunk_size)):
+                    chunk = vertex[start : start + int(chunk_size)]
+                    valid = valid_mask(chunk)
+                    if valid.all():
+                        chunk.tofile(stream)
+                    elif valid.any():
+                        chunk[valid].tofile(stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp_name, output)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    print(
+        f"[merge_ply_layers] streaming merge wrote {total} gaussians",
+        flush=True,
+    )
+    return out_path
+
+
 def merge_ply_layers(
     ply_paths: List[str],
     out_path: str,
     voxel_size: float = 0.0005,
-    min_opacity: float = 0.001,
+    min_opacity: float = -20.0,
     max_points: Optional[int] = None,
 ) -> str:
     if not ply_paths:
         raise ValueError("No PLY paths provided")
     if max_points is not None and int(max_points) <= 0:
         max_points = None
+    if float(voxel_size or 0.0) <= 0.0 and max_points is None:
+        try:
+            return _stream_merge_ply_layers(
+                ply_paths,
+                out_path,
+                min_opacity=min_opacity,
+            )
+        except Exception as exc:
+            print(
+                f"[merge_ply_layers] streaming path unavailable, using in-memory merge: {exc}",
+                flush=True,
+            )
 
     base_vertex = PlyData.read(ply_paths[0])["vertex"].data
     base_dtype = base_vertex.dtype
@@ -1199,7 +1361,13 @@ def merge_ply_layers(
         for j, idxs in enumerate(buckets.values()):
             idxs = np.asarray(idxs, dtype=np.int64)
             if "opacity" in merged.dtype.names:
-                opacity = np.asarray(merged["opacity"][idxs], dtype=np.float32).reshape(-1)
+                opacity_logits = np.asarray(
+                    merged["opacity"][idxs],
+                    dtype=np.float32,
+                ).reshape(-1)
+                opacity = 1.0 / (
+                    1.0 + np.exp(-np.clip(opacity_logits, -30.0, 30.0))
+                )
                 if "scale_0" in merged.dtype.names and "scale_1" in merged.dtype.names and "scale_2" in merged.dtype.names:
                     scale_vals = np.stack([
                         np.asarray(merged["scale_0"][idxs], dtype=np.float32).reshape(-1),
@@ -1271,4 +1439,51 @@ def global_refine_after_merge(
         freeze_sh_coeffs=True,
         freeze_opacity=False,
         preserve_initial_opacity_floor=True,
+    )
+
+
+def mood_refine_after_merge(
+    traindata: Dict,
+    initial_ply_path: str,
+    out_ply_path: str,
+    num_iterations: int = 120,
+    rasterizer: str = "cpp",
+    device: str = "mps",
+) -> str:
+    """Short appearance-only fit for a mood variant.
+
+    Geometry, scale, rotation and opacity are reused verbatim. Only spherical
+    harmonic color coefficients are optimized against the relit ERP views.
+    """
+    params, labels = extract_gaussian_params_from_ply(initial_ply_path)
+    print(
+        "[mood] Appearance refine: geometry and opacity frozen; optimizing SH only.",
+        flush=True,
+    )
+    return train_with_splat_apple(
+        traindata=traindata,
+        out_ply_path=out_ply_path,
+        num_iterations=int(num_iterations),
+        rasterizer=rasterizer,
+        device=device,
+        adaptive=False,
+        densify_interval=max(1, int(num_iterations) + 1),
+        prune_threshold=0.0,
+        clone_fraction=0.0,
+        max_points=0,
+        downsample_ratio=1.0,
+        repulsion_weight=0.0,
+        mean_lr_scale=0.0,
+        training_profile=None,
+        initial_gaussian_params=params,
+        initial_gaussian_labels=labels,
+        opacity_reg_weight=0.0,
+        opacity_mean_reg_weight=0.0,
+        blur_reg_weight=0.0,
+        scale_log_min=-20.0,
+        scale_log_max=20.0,
+        freeze_geometry=True,
+        freeze_sh_coeffs=False,
+        freeze_opacity=True,
+        preserve_initial_opacity_floor=False,
     )

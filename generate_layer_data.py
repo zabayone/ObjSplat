@@ -25,12 +25,11 @@ UTILITY_PATH = PROJECT_ROOT / "submodules" / "360monodepth" / "code" / "python" 
 if str(UTILITY_PATH) not in sys.path:
     sys.path.insert(0, str(UTILITY_PATH))
 
-import spherical_coordinates as sc
-
 from utils.depth_alignment import Pano_depth_estimation
 import utils.pano_utils.Equirec2Perspec as E2P
 from utils.trajectory import gcd_pose_gs
 from utils.semantic_instance_detection import detect_objects_grounding_then_sam_on_panorama
+from utils.sky_segmentation import segment_sky_segformer
 
 
 def _numeric_suffix_key(path: Path) -> tuple[int, str]:
@@ -356,6 +355,16 @@ def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _link_or_copy(source: Path, target: Path) -> None:
+    """Reuse immutable perspective RGBs without re-encoding them per layer."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.unlink(missing_ok=True)
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+
+
 def _load_rgb(input_dir: Path) -> np.ndarray:
     rgb_path = input_dir / "rgb.png"
     if not rgb_path.exists():
@@ -399,11 +408,14 @@ def _generate_frames(
     frames_dir: Path,
     n: int = 8,
     phi_bands: Optional[List[float]] = None,
+    perspective_size: Optional[int] = 1024,
 ) -> None:
     _ensure_dir(frames_dir)
     pano_h = int(pano_rgb.shape[0])
     pers_size = int((pano_h / 1024.0) * 512)
     pers_size = max(128, pers_size)
+    if perspective_size is not None and int(perspective_size) > 0:
+        pers_size = min(pers_size, int(perspective_size))
 
     if phi_bands is None:
         phi_bands = [80.0, 67.5, 45.0, 0.0, -45.0, -67.5, -80.0]
@@ -438,6 +450,7 @@ def _ensure_frames_dir(
     preferred: Optional[Path],
     n_views: int = 8,
     phi_bands: Optional[List[float]] = None,
+    perspective_size: Optional[int] = 1024,
 ) -> Path:
     if preferred is not None and preferred.exists():
         return preferred
@@ -449,7 +462,24 @@ def _ensure_frames_dir(
     default_dir = input_dir / "traindata" / "perspective_frames" / "frames"
     existing_frames = sorted(default_dir.glob("rgb_*.png"), key=_numeric_suffix_key)
     existing_poses = sorted(default_dir.glob("transform_matrix_*.npy"), key=_numeric_suffix_key)
-    if len(existing_frames) == expected_count and len(existing_poses) >= expected_count:
+    size_matches = True
+    if existing_frames and perspective_size is not None and int(perspective_size) > 0:
+        try:
+            with Image.open(existing_frames[0]) as sample:
+                with Image.open(input_dir / "rgb.png") as pano_sample:
+                    pano_h = int(pano_sample.height)
+                expected_size = min(
+                    max(128, int((pano_h / 1024.0) * 512)),
+                    int(perspective_size),
+                )
+                size_matches = sample.size == (expected_size, expected_size)
+        except Exception:
+            size_matches = False
+    if (
+        len(existing_frames) == expected_count
+        and len(existing_poses) >= expected_count
+        and size_matches
+    ):
         return default_dir
     if existing_frames:
         print(
@@ -460,24 +490,48 @@ def _ensure_frames_dir(
             path.unlink(missing_ok=True)
 
     pano_rgb = _load_rgb(input_dir)
-    _generate_frames(pano_rgb, default_dir, n=n_views, phi_bands=phi_bands)
+    _generate_frames(
+        pano_rgb,
+        default_dir,
+        n=n_views,
+        phi_bands=phi_bands,
+        perspective_size=perspective_size,
+    )
     return default_dir
 
 
 def _erp_pointcloud(depth: np.ndarray, rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    pixel_x, pixel_y = np.meshgrid(range(depth.shape[1]), range(depth.shape[0]))
-    theta, phi = sc.erp2sph([pixel_x, pixel_y])
+    depth = np.asarray(depth, dtype=np.float32)
+    if depth.shape[:2] != rgb.shape[:2]:
+        raise ValueError(
+            f"Depth/RGB shape mismatch: depth={depth.shape[:2]} rgb={rgb.shape[:2]}"
+        )
+    height, width = depth.shape[:2]
+    # Compute spherical directions as separable 1D vectors. The previous
+    # meshgrid path materialized several 50M-element int64/float64 arrays for a
+    # 10k ERP and could consume multiple gigabytes before training even began.
+    theta = (
+        np.arange(width, dtype=np.float32) * (2.0 * np.pi / width)
+        + np.pi / width
+        - np.pi
+    )[None, :]
+    phi = (
+        -(
+            np.arange(height, dtype=np.float32) * (np.pi / height)
+            + np.pi / (2.0 * height)
+        )
+        + 0.5 * np.pi
+    )[:, None]
+    sin_theta = np.sin(theta)
+    cos_theta = np.cos(theta)
+    sin_phi = np.sin(phi)
+    cos_phi = np.cos(phi)
 
-    x = (depth * np.cos(phi) * np.sin(theta)).flatten()
-    y = -(depth * np.sin(phi)).flatten()
-    z = (depth * np.cos(phi) * np.cos(theta)).flatten()
-
-    r = rgb[pixel_y, pixel_x, 0].flatten()
-    g = rgb[pixel_y, pixel_x, 1].flatten()
-    b = rgb[pixel_y, pixel_x, 2].flatten()
-
-    xyz = np.stack([x, y, z], axis=1).astype(np.float32)
-    colors = np.stack([r, g, b], axis=1).astype(np.uint8)
+    x = (depth * cos_phi * sin_theta).reshape(-1)
+    y = (-depth * sin_phi).reshape(-1)
+    z = (depth * cos_phi * cos_theta).reshape(-1)
+    xyz = np.stack([x, y, z], axis=1).astype(np.float32, copy=False)
+    colors = np.asarray(rgb, dtype=np.uint8).reshape(-1, 3).copy()
     return xyz, colors
 
 
@@ -542,6 +596,8 @@ def _filter_instances(
 def _filter_erp_instances(
     erp_masks: Dict[int, np.ndarray],
     instance_maps: Dict[int, np.ndarray],
+    min_frame_area: int,
+    min_frames: int,
     min_total_pixels: int,
 ) -> Dict[int, InstanceStats]:
     stats: Dict[int, InstanceStats] = {}
@@ -554,8 +610,10 @@ def _filter_erp_instances(
             continue
         frame_count = 0
         for fmap in instance_maps.values():
-            if np.any(np.asarray(fmap) == inst_id):
+            if int(np.count_nonzero(np.asarray(fmap) == inst_id)) >= int(min_frame_area):
                 frame_count += 1
+        if frame_count < int(min_frames):
+            continue
         stats[inst_id] = InstanceStats(
             instance_id=inst_id,
             frame_count=frame_count,
@@ -718,8 +776,9 @@ def _consolidate_layer_label_map(
     labels_2d: np.ndarray,
     layer_groups: List[dict],
     pano_rgb: np.ndarray,
+    fill_unassigned: bool = False,
 ) -> Tuple[np.ndarray, dict]:
-    """Make layer assignment dense and remove obvious semantic/fragment errors."""
+    """Consolidate semantic layers and remove obvious fragment errors."""
     h, w = labels_2d.shape[:2]
     layer_map = np.full((h, w), -1, dtype=np.int32)
     for layer_idx, group in enumerate(layer_groups):
@@ -791,28 +850,33 @@ def _consolidate_layer_label_map(
             layer_map[comp] = int(target)
             cleanup["small_component_reassigned_pixels"] += area
 
-    layer_map, filled = _fill_unassigned_by_nearest_layer(layer_map)
-    cleanup["residual_reassigned_pixels"] = int(filled)
+    if fill_unassigned:
+        layer_map, filled = _fill_unassigned_by_nearest_layer(layer_map)
+        cleanup["residual_reassigned_pixels"] = int(filled)
 
-    if (layer_map < 0).any() and (layer_map >= 0).any():
-        # Last resort for rare isolated pixels: iteratively grow assigned labels.
-        for _ in range(max(h, w)):
-            unknown = layer_map < 0
-            if not unknown.any():
-                break
-            changed = False
-            for layer_idx in range(len(layer_groups)):
-                mask = layer_map == layer_idx
-                if not mask.any():
-                    continue
-                grown = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1).astype(bool)
-                claim = grown & unknown
-                if claim.any():
-                    layer_map[claim] = int(layer_idx)
-                    cleanup["residual_reassigned_pixels"] += int(claim.sum())
-                    changed = True
-            if not changed:
-                break
+        if (layer_map < 0).any() and (layer_map >= 0).any():
+            # Compatibility mode for legacy dense semantic partitions.
+            for _ in range(max(h, w)):
+                unknown = layer_map < 0
+                if not unknown.any():
+                    break
+                changed = False
+                for layer_idx in range(len(layer_groups)):
+                    mask = layer_map == layer_idx
+                    if not mask.any():
+                        continue
+                    grown = cv2.dilate(
+                        mask.astype(np.uint8),
+                        np.ones((3, 3), np.uint8),
+                        iterations=1,
+                    ).astype(bool)
+                    claim = grown & unknown
+                    if claim.any():
+                        layer_map[claim] = int(layer_idx)
+                        cleanup["residual_reassigned_pixels"] += int(claim.sum())
+                        changed = True
+                if not changed:
+                    break
 
     return layer_map, cleanup
 
@@ -892,6 +956,12 @@ def _clear_generated_layer_outputs(save_path: Path) -> None:
     layer_instances_dir = traindata_dir / "layer_instances"
     if layer_instances_dir.exists():
         shutil.rmtree(layer_instances_dir)
+    sky_dir = traindata_dir / "sky"
+    if sky_dir.exists():
+        shutil.rmtree(sky_dir)
+    moods_dir = traindata_dir / "moods"
+    if moods_dir.exists():
+        shutil.rmtree(moods_dir)
 
 
 def generate_layer_data(
@@ -902,7 +972,7 @@ def generate_layer_data(
     device: str = "mps",
     sam_checkpoint: str = "checkpoints/sam_vit_h_4b8939.pth",
     use_grounding_dino: bool = False,
-    grounding_dino_checkpoint: str = "checkpoints/groundingdino_swinb_cogvlm.pth",
+    grounding_dino_checkpoint: str = "IDEA-Research/grounding-dino-base",
     sam_variant: str = "sam2",
     sam2_checkpoint: str = "checkpoints/SAM 2.1 Hiera Large.pt",
     min_frame_area: int = 2000,
@@ -913,9 +983,10 @@ def generate_layer_data(
     frames_dir: Optional[str] = None,
     n_views: int = 8,
     phi_bands: Optional[List[float]] = None,
+    perspective_size: Optional[int] = 1024,
     auto_depth_scale: bool = False,
     target_scene_scale: float = 0.5,
-    use_full_scene_background: bool = True,
+    use_full_scene_background: bool = False,
     equirect_min_votes: int = 1,
     equirect_kernel_size: int = 15,
     grounding_prompts: Optional[str] = None,
@@ -930,14 +1001,43 @@ def generate_layer_data(
     grounding_min_component_area_ratio: float = 0.02,
     grounding_morph_open_kernel: int = 5,
     aggregate_by_label: bool = False,
+    require_sky_layer: bool = False,
+    fill_unassigned_layers: bool = False,
+    sky_segmentation_backend: str = "grounding_sam",
+    sky_segformer_model: str = "nvidia/segformer-b2-finetuned-ade-512-512",
+    sky_segformer_max_side: int = 2048,
+    sky_segformer_threshold: float = 0.45,
+    sky_sphere_radius: float = 0.0,
+    sky_radius_percentile: float = 95.0,
+    sky_radius_scale: float = 1.25,
 ) -> Path:
     input_path = Path(input_dir)
     save_path = Path(save_dir) if save_dir else input_path
 
+    pano_rgb = _load_rgb(input_path)
     depth = _load_depth(input_path, depth_model, force=False)
+    depth = np.asarray(depth, dtype=np.float32).squeeze()
+    if depth.shape != pano_rgb.shape[:2]:
+        raise ValueError(
+            f"Cached/estimated depth shape {depth.shape} does not match RGB "
+            f"{pano_rgb.shape[:2]}; remove the stale depth.npy and rerun"
+        )
+    invalid_depth = ~np.isfinite(depth) | (depth <= 0)
+    invalid_depth_fraction = float(invalid_depth.mean())
+    if invalid_depth_fraction > 0.05:
+        raise RuntimeError(
+            f"Depth contains {invalid_depth_fraction:.2%} invalid/non-positive pixels"
+        )
+    if invalid_depth.any():
+        safe_depth = np.where(invalid_depth, 0.0, depth).astype(np.float32)
+        depth = cv2.inpaint(
+            safe_depth,
+            invalid_depth.astype(np.uint8),
+            inpaintRadius=3,
+            flags=cv2.INPAINT_TELEA,
+        )
     if depth_scale and float(depth_scale) != 1.0:
         depth = depth * float(depth_scale)
-    pano_rgb = _load_rgb(input_path)
     xyz, colors = _erp_pointcloud(depth, pano_rgb)
 
     final_depth_scale = float(depth_scale)
@@ -959,6 +1059,7 @@ def generate_layer_data(
         Path(frames_dir) if frames_dir else None,
         n_views=n_views,
         phi_bands=phi_bands,
+        perspective_size=perspective_size,
     )
 
     # Optional final refine layer not created by default. Set to None unless explicit refine requested.
@@ -991,6 +1092,18 @@ def generate_layer_data(
         min_component_area_ratio=grounding_min_component_area_ratio,
         morph_open_kernel=grounding_morph_open_kernel,
     )
+    grounding_status = res.get("grounding_status", {})
+    if use_grounding_dino and not grounding_status.get("succeeded", False):
+        raise RuntimeError(
+            "GroundingDINO was requested but did not produce detections: "
+            f"{grounding_status.get('error') or 'no boxes above threshold'}"
+        )
+    sam_status = res.get("sam_status", {})
+    if not sam_status.get("succeeded", False):
+        raise RuntimeError(
+            "SAM segmentation failed: "
+            f"{sam_status.get('error') or 'no masks returned'}"
+        )
 
     erp_instance_map = res.get("instance_map")
     erp_masks = res.get("masks", {})
@@ -1003,11 +1116,166 @@ def generate_layer_data(
     grounding_tags = {int(k): str(v) for k, v in res.get("tags", {}).items()}
     grounding_scores = {int(k): float(v) for k, v in res.get("scores", {}).items()}
     grounding_detections = list(res.get("detections", []))
+    sky_segmentation_diagnostics: Optional[dict] = None
+    sky_backend = str(sky_segmentation_backend or "grounding_sam").strip().lower()
+    if sky_backend not in {"grounding_sam", "hybrid", "segformer"}:
+        raise ValueError(
+            "--sky_segmentation_backend must be one of: grounding_sam, hybrid, segformer"
+        )
+    if sky_backend in {"hybrid", "segformer"}:
+        try:
+            semantic_sky, sky_segmentation_diagnostics = segment_sky_segformer(
+                pano_rgb,
+                model_id=sky_segformer_model,
+                device=device,
+                max_side=sky_segformer_max_side,
+                threshold=sky_segformer_threshold,
+                seam_ensemble=True,
+            )
+            if not semantic_sky.any():
+                raise RuntimeError("SegFormer returned an empty sky mask")
+
+            old_sky_ids = {
+                int(inst_id)
+                for inst_id, label in grounding_tags.items()
+                if _normalize_group_label(label, "") == "sky"
+            }
+            # Preserve high-resolution SAM silhouettes (branches, poles, wires,
+            # roofs) that a lower-resolution semantic model may classify as
+            # sky. Layout-like ground classes are deliberately excluded.
+            non_protective_labels = {
+                "sky", "road", "street", "pavement", "sidewalk",
+                "ground", "grass", "floor",
+            }
+            foreground_protection = np.zeros_like(semantic_sky, dtype=bool)
+            semantic_sky_pixels = max(1, int(semantic_sky.sum()))
+            protection_candidates = []
+            for inst_id, instance_mask in grounding_erp_masks.items():
+                label = _normalize_group_label(grounding_tags.get(int(inst_id)), "")
+                if label and label not in non_protective_labels:
+                    instance_mask = np.asarray(instance_mask, dtype=bool)
+                    instance_pixels = max(1, int(instance_mask.sum()))
+                    overlap = instance_mask & semantic_sky
+                    overlap_pixels = int(overlap.sum())
+                    semantic_share = float(overlap_pixels / semantic_sky_pixels)
+                    instance_overlap = float(overlap_pixels / instance_pixels)
+
+                    # SAM is valuable for thin high-resolution silhouettes, but
+                    # occasional broad "tree/leaves" masks also include most of
+                    # the visible sky. Such a mask must not veto the semantic
+                    # sky estimate. The conservative limits below still retain
+                    # poles, wires, branches and compact foreground objects.
+                    accepted = (
+                        overlap_pixels > 0
+                        and semantic_share <= 0.08
+                        and instance_overlap <= 0.35
+                    )
+                    protection_candidates.append({
+                        "instance_id": int(inst_id),
+                        "label": label,
+                        "instance_pixels": int(instance_pixels),
+                        "overlap_pixels": int(overlap_pixels),
+                        "semantic_sky_share": semantic_share,
+                        "instance_overlap_fraction": instance_overlap,
+                        "accepted": bool(accepted),
+                    })
+            # Also cap the aggregate veto: several individually plausible SAM
+            # masks must not collectively punch a large hole in the sky.
+            aggregate_limit = int(round(semantic_sky_pixels * 0.15))
+            for item in sorted(
+                (candidate for candidate in protection_candidates if candidate["accepted"]),
+                key=lambda candidate: candidate["overlap_pixels"],
+            ):
+                instance_mask = np.asarray(
+                    grounding_erp_masks[item["instance_id"]], dtype=bool
+                )
+                proposed = foreground_protection | (instance_mask & semantic_sky)
+                if int(proposed.sum()) <= aggregate_limit:
+                    foreground_protection = proposed
+                else:
+                    item["accepted"] = False
+                    item["rejection_reason"] = "aggregate_sky_protection_limit"
+            sky_segmentation_diagnostics["sam_foreground_protection"] = {
+                "max_semantic_sky_share": 0.08,
+                "max_instance_overlap_fraction": 0.35,
+                "max_aggregate_semantic_sky_share": 0.15,
+                "candidates": protection_candidates,
+                "accepted_instance_ids": [
+                    item["instance_id"] for item in protection_candidates if item["accepted"]
+                ],
+                "rejected_instance_ids": [
+                    item["instance_id"] for item in protection_candidates
+                    if item["overlap_pixels"] > 0 and not item["accepted"]
+                ],
+            }
+            if foreground_protection.any():
+                semantic_sky &= ~foreground_protection
+                sky_segmentation_diagnostics["protected_foreground_pixels"] = int(
+                    foreground_protection.sum()
+                )
+                sky_segmentation_diagnostics["coverage_after_sam_protection"] = float(
+                    semantic_sky.mean()
+                )
+            if not semantic_sky.any():
+                raise RuntimeError(
+                    "SegFormer sky mask became empty after foreground protection"
+                )
+
+            for inst_id in old_sky_ids:
+                grounding_erp_masks.pop(inst_id, None)
+                grounding_tags.pop(inst_id, None)
+                grounding_scores.pop(inst_id, None)
+
+            for inst_id in list(grounding_erp_masks):
+                trimmed = np.asarray(grounding_erp_masks[inst_id], dtype=bool) & ~semantic_sky
+                if trimmed.any():
+                    grounding_erp_masks[inst_id] = trimmed
+                else:
+                    grounding_erp_masks.pop(inst_id, None)
+                    grounding_tags.pop(inst_id, None)
+                    grounding_scores.pop(inst_id, None)
+
+            new_sky_id = max([0, *grounding_erp_masks.keys(), *grounding_tags.keys()]) + 1
+            grounding_erp_masks[new_sky_id] = semantic_sky
+            grounding_tags[new_sky_id] = "sky"
+            grounding_scores[new_sky_id] = float(
+                sky_segmentation_diagnostics.get("mean_sky_probability", 0.0)
+            )
+            rebuilt_map = np.zeros(pano_rgb.shape[:2], dtype=np.int32)
+            for inst_id, mask in grounding_erp_masks.items():
+                rebuilt_map[np.asarray(mask, dtype=bool)] = int(inst_id)
+            grounding_erp_instance_map = rebuilt_map
+            erp_masks = grounding_erp_masks
+            erp_instance_map = rebuilt_map
+            grounding_detections.append({
+                "box": None,
+                "label": "sky",
+                "score": grounding_scores[new_sky_id],
+                "source": "segformer",
+            })
+            print(
+                "[SkySegmentation] SegFormer coverage="
+                f"{sky_segmentation_diagnostics['coverage']:.4f}"
+            )
+        except Exception as exc:
+            if sky_backend == "segformer":
+                raise
+            print(f"[WARN] SegFormer sky segmentation failed; using Grounding-SAM sky: {exc}")
+            sky_segmentation_diagnostics = {
+                "model": sky_segformer_model,
+                "status": "fallback",
+                "error": str(exc),
+            }
     label_filters = _parse_label_filter(grounding_exclude_labels)
     grounding_excluded_ids = {
         int(inst_id)
         for inst_id, label in grounding_tags.items()
         if _label_matches_filter(label, label_filters)
+    }
+    sky_instance_ids = {
+        int(inst_id)
+        for inst_id, label in grounding_tags.items()
+        if _normalize_group_label(label, "") == "sky"
     }
     if grounding_excluded_ids:
         excluded_labels = sorted(
@@ -1038,12 +1306,27 @@ def generate_layer_data(
     if not instance_maps:
         raise RuntimeError("Segmentation returned no instance maps")
 
-    grounding_min_total_pixels = min(int(min_total_pixels), int(grounding_mask_min_area))
+    grounding_min_total_pixels = int(min_total_pixels)
     raw_stats = _filter_erp_instances(
         grounding_erp_masks,
         instance_maps,
+        min_frame_area=min_frame_area,
+        min_frames=min_frames,
         min_total_pixels=grounding_min_total_pixels,
     )
+    # Sky is a structural scene layer, not an optional small object. Keep it
+    # even when generic object thresholds would otherwise discard it.
+    for inst_id in sorted(sky_instance_ids):
+        mask = grounding_erp_masks.get(inst_id)
+        if mask is None or not np.asarray(mask, dtype=bool).any():
+            continue
+        if inst_id not in raw_stats:
+            raw_stats[inst_id] = InstanceStats(
+                instance_id=inst_id,
+                frame_count=sum(bool(np.any(fmap == inst_id)) for fmap in instance_maps.values()),
+                total_pixels=int(np.asarray(mask, dtype=bool).sum()),
+                points_3d=0,
+            )
     for inst_id in grounding_excluded_ids:
         raw_stats.pop(int(inst_id), None)
     if not raw_stats:
@@ -1082,7 +1365,7 @@ def generate_layer_data(
     for inst_id, stat in list(raw_stats.items()):
         points = int((labels_3d == inst_id).sum())
         stat.points_3d = points
-        if points < min_points_3d:
+        if points <= 0 or (points < min_points_3d and inst_id not in sky_instance_ids):
             raw_stats.pop(inst_id)
 
     if not raw_stats:
@@ -1093,6 +1376,12 @@ def generate_layer_data(
     _ensure_dir(meta_dir)
 
     selected_ids = sorted(raw_stats.keys())
+    selected_sky_ids = [inst_id for inst_id in selected_ids if inst_id in sky_instance_ids]
+    if require_sky_layer and not selected_sky_ids:
+        raise RuntimeError(
+            "No sky mask was found. Add 'sky' to --grounding_prompts or disable "
+            "--require_sky_layer for scenes without visible sky."
+        )
     instance_to_layer = {inst_id: idx for idx, inst_id in enumerate(selected_ids)}
     overlay_masks: List[Tuple[int, np.ndarray]] = []
 
@@ -1128,18 +1417,32 @@ def generate_layer_data(
         for group_label in sorted(grouped.keys()):
             layer_groups.append({"group_label": group_label, "instance_ids": sorted(grouped[group_label])})
     else:
-        layer_groups = [
+        # Sky detections may straddle the ERP seam or arrive as multiple boxes;
+        # they must still become one scene layer.
+        if selected_sky_ids:
+            layer_groups.append({"group_label": "sky", "instance_ids": sorted(selected_sky_ids)})
+        layer_groups.extend([
             {"group_label": _normalize_group_label(grounding_tags.get(int(inst_id)), f"instance_{inst_id}"),
              "instance_ids": [int(inst_id)]}
-            for inst_id in selected_ids
-        ]
+            for inst_id in selected_ids if inst_id not in sky_instance_ids
+        ])
+
+    sky_layer_idx = next(
+        (idx for idx, group in enumerate(layer_groups) if _group_is_semantic(group, {"sky"})),
+        None,
+    )
 
     instance_to_layer = {}
     for layer_idx, group in enumerate(layer_groups):
         for inst_id in group["instance_ids"]:
             instance_to_layer[int(inst_id)] = int(layer_idx)
 
-    layer_map_2d, cleanup_stats = _consolidate_layer_label_map(labels_2d, layer_groups, pano_rgb)
+    layer_map_2d, cleanup_stats = _consolidate_layer_label_map(
+        labels_2d,
+        layer_groups,
+        pano_rgb,
+        fill_unassigned=fill_unassigned_layers,
+    )
     labels_2d = _labels_from_consolidated_layer_map(labels_2d, layer_map_2d, layer_groups)
     labels_3d = labels_2d.reshape(-1).astype(np.int32)
     for inst_id, stat in raw_stats.items():
@@ -1152,6 +1455,16 @@ def generate_layer_data(
         f"[LayerData] Writing {len(layer_groups)} training layers "
         f"from {len(selected_ids)} instances"
     )
+    scene_radii = np.linalg.norm(xyz, axis=1)
+    valid_scene_radii = scene_radii[np.isfinite(scene_radii) & (scene_radii > 1e-6)]
+    if float(sky_sphere_radius) > 0:
+        effective_sky_radius = float(sky_sphere_radius)
+    elif valid_scene_radii.size:
+        percentile = float(np.clip(sky_radius_percentile, 50.0, 100.0))
+        effective_sky_radius = float(np.percentile(valid_scene_radii, percentile))
+        effective_sky_radius *= max(1.0, float(sky_radius_scale))
+    else:
+        effective_sky_radius = 1.0
     frame_items = sorted(instance_maps.items(), key=lambda item: int(item[0]))
     for layer_idx, group in enumerate(layer_groups):
         group_ids = np.array(group["instance_ids"], dtype=np.int32)
@@ -1161,6 +1474,12 @@ def generate_layer_data(
 
         mask_points = np.isin(labels_3d, group_ids)
         inst_xyz = xyz[mask_points]
+        if sky_layer_idx is not None and layer_idx == sky_layer_idx:
+            directions = inst_xyz / np.maximum(
+                np.linalg.norm(inst_xyz, axis=1, keepdims=True),
+                1e-8,
+            )
+            inst_xyz = (directions * effective_sky_radius).astype(np.float32)
         inst_rgb = colors[mask_points]
         inst_labels = labels_3d[mask_points].astype(np.int32)
 
@@ -1193,10 +1512,21 @@ def generate_layer_data(
             frame_mask = _resize_mask_to_shape(frame_mask, rgb.shape[:2])
             if not _mask_has_training_content(frame_mask):
                 continue
-            Image.fromarray(_masked_rgb(rgb, frame_mask)).save(frames_out / f"rgb_{frame_idx}.png")
+            # Keep the real RGB target and supervise it only through an
+            # explicit mask. Training on black-filled crops teaches every
+            # layer a dark halo, which becomes visible after composition.
+            _link_or_copy(rgb_path, frames_out / f"rgb_{frame_idx}.png")
+            Image.fromarray(frame_mask.astype(np.uint8) * 255).save(
+                frames_out / f"mask_{frame_idx}.png"
+            )
             np.save(frames_out / f"transform_matrix_{frame_idx}.npy", np.load(pose_path))
 
         _save_erp_outputs(layer_dir, pano_rgb, erp_mask, f"layer{layer_idx}")
+        if sky_layer_idx is not None and layer_idx == sky_layer_idx:
+            sky_dir = save_path / "traindata" / "sky"
+            _ensure_dir(sky_dir)
+            Image.fromarray((erp_mask.astype(np.uint8) * 255)).save(sky_dir / "mask.png")
+            Image.fromarray(_masked_rgb(pano_rgb, erp_mask)).save(sky_dir / "day_rgb.png")
         overlay_masks.append((layer_idx, erp_mask))
 
     selected_union_2d = np.isin(labels_2d, np.array(selected_ids, dtype=np.int32))
@@ -1208,9 +1538,14 @@ def generate_layer_data(
         background_layer_idx = len(layer_groups)
 
         if effective_full_scene_background:
-            # Full-scene background keeps all points and all valid panorama pixels.
-            bg_point_mask = np.ones((labels_3d.shape[0],), dtype=bool)
-            bg_erp_mask = np.ones(labels_2d.shape, dtype=bool)
+            # Keep the full non-sky scene. Duplicating daytime sky here would
+            # make a later day/night layer switch impossible.
+            if selected_sky_ids:
+                bg_point_mask = ~np.isin(labels_3d, np.asarray(selected_sky_ids, dtype=np.int32))
+                bg_erp_mask = ~np.isin(labels_2d, np.asarray(selected_sky_ids, dtype=np.int32))
+            else:
+                bg_point_mask = np.ones((labels_3d.shape[0],), dtype=bool)
+                bg_erp_mask = np.ones(labels_2d.shape, dtype=bool)
             bg_labels_full = np.where(selected_union_3d, labels_3d, 0).astype(np.int32)
         else:
             # Non-full background: keep the *uncovered* points as background
@@ -1260,7 +1595,10 @@ def generate_layer_data(
                 bg_mask = _resize_mask_to_shape(bg_mask, rgb.shape[:2])
                 if not _mask_has_training_content(bg_mask):
                     continue
-                Image.fromarray(_masked_rgb(rgb, bg_mask)).save(frames_out / f"rgb_{frame_idx}.png")
+                _link_or_copy(rgb_path, frames_out / f"rgb_{frame_idx}.png")
+                Image.fromarray(bg_mask.astype(np.uint8) * 255).save(
+                    frames_out / f"mask_{frame_idx}.png"
+                )
                 np.save(frames_out / f"transform_matrix_{frame_idx}.npy", np.load(pose_path))
 
             _save_erp_outputs(layer_dir, pano_rgb, bg_erp_mask, f"layer{background_layer_idx}")
@@ -1316,7 +1654,10 @@ def generate_layer_data(
             residual_frame_mask = _resize_mask_to_shape(residual_frame_mask, rgb.shape[:2])
             if not _mask_has_training_content(residual_frame_mask):
                 continue
-            Image.fromarray(_masked_rgb(rgb, residual_frame_mask)).save(frames_out / f"rgb_{frame_idx}.png")
+            _link_or_copy(rgb_path, frames_out / f"rgb_{frame_idx}.png")
+            Image.fromarray(residual_frame_mask.astype(np.uint8) * 255).save(
+                frames_out / f"mask_{frame_idx}.png"
+            )
             np.save(frames_out / f"transform_matrix_{frame_idx}.npy", np.load(pose_path))
 
     _save_layer_panorama_overlay(
@@ -1331,7 +1672,14 @@ def generate_layer_data(
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "input_dir": str(input_path),
         "frames_dir": str(frames_path),
+        "view_grid": {
+            "n_views": int(n_views),
+            "phi_bands": [float(value) for value in (phi_bands or [])],
+            "perspective_size": int(perspective_size) if perspective_size else None,
+            "fov_degrees": 90.0,
+        },
         "depth_scale": float(depth_scale),
+        "invalid_depth_fraction": invalid_depth_fraction,
         "auto_depth_scaled": bool(auto_scaled),
         "final_depth_scale": float(final_depth_scale),
         "instance_count": len(selected_ids),
@@ -1370,8 +1718,30 @@ def generate_layer_data(
             "min_component_area_ratio": float(grounding_min_component_area_ratio),
             "morph_open_kernel": int(grounding_morph_open_kernel),
             "detections": grounding_detections,
+            "status": grounding_status,
+            "sam_status": sam_status,
         },
         "segmentation_cleanup": cleanup_stats,
+        "fill_unassigned_layers": bool(fill_unassigned_layers),
+        "sky_segmentation": {
+            "backend": sky_backend,
+            "segformer": sky_segmentation_diagnostics,
+        },
+        "sky_layer_idx": sky_layer_idx,
+        "sky": {
+            "layer_idx": sky_layer_idx,
+            "instance_ids": [int(inst_id) for inst_id in selected_sky_ids],
+            "mask_path": "traindata/sky/mask.png" if sky_layer_idx is not None else None,
+            "day_erp_path": "traindata/sky/day_rgb.png" if sky_layer_idx is not None else None,
+            "night_erp_path": "traindata/sky/night_rgb.png",
+            "role": "environment",
+            "geometry": {
+                "type": "sphere",
+                "radius": float(effective_sky_radius),
+                "radius_percentile": float(sky_radius_percentile),
+                "radius_scale": float(sky_radius_scale),
+            },
+        },
         "background_layer_idx": background_layer_idx,
         "residual_layer_idx": residual_layer_idx,
         "final_refine_layer_idx": final_refine_layer_idx,
@@ -1409,10 +1779,11 @@ def main() -> None:
     parser.add_argument("--frames_dir", default=None, help="Use an existing frames directory")
     parser.add_argument("--n_views", type=int, default=12)
     parser.add_argument("--phi_bands", default="80,67.5,45,0,-45,-67.5,-80", help="Comma-separated phi bands in degrees")
+    parser.add_argument("--perspective_size", type=int, default=1024)
     parser.add_argument("--equirect_min_votes", type=int, default=1)
     parser.add_argument("--equirect_kernel_size", type=int, default=15)
     parser.add_argument("--use_grounding_dino", action="store_true", help="Enable GroundingDINO proposals + tagging")
-    parser.add_argument("--grounding_dino_checkpoint", default="checkpoints/groundingdino_swinb_cogvlm.pth")
+    parser.add_argument("--grounding_dino_checkpoint", default="IDEA-Research/grounding-dino-base")
     parser.add_argument("--grounding_prompts", default=None, help="GroundingDINO prompt string, e.g. 'person . chair . table'")
     parser.add_argument("--grounding_box_threshold", type=float, default=0.25)
     parser.add_argument("--grounding_text_threshold", type=float, default=0.20)
@@ -1425,11 +1796,20 @@ def main() -> None:
     parser.add_argument("--grounding_min_component_area_ratio", type=float, default=0.02, help="Drop detached SAM mask components smaller than this fraction of total mask area")
     parser.add_argument("--grounding_morph_open_kernel", type=int, default=5, help="Opening kernel used to remove thin detached mask artifacts; set 0 to disable")
     parser.add_argument("--aggregate_by_label", action="store_true", help="Group same-label Grounding-SAM instances into shared training layers while preserving instance labels")
+    parser.add_argument("--fill_unassigned_layers", action="store_true", help="Force uncovered ERP pixels into nearest detected layers")
+    parser.add_argument("--require_sky_layer", action="store_true", help="Fail if no semantic sky layer can be isolated")
+    parser.add_argument("--sky_segmentation_backend", default="grounding_sam", choices=["grounding_sam", "hybrid", "segformer"])
+    parser.add_argument("--sky_segformer_model", default="nvidia/segformer-b2-finetuned-ade-512-512")
+    parser.add_argument("--sky_segformer_max_side", type=int, default=2048)
+    parser.add_argument("--sky_segformer_threshold", type=float, default=0.45)
+    parser.add_argument("--sky_sphere_radius", type=float, default=0.0)
+    parser.add_argument("--sky_radius_percentile", type=float, default=95.0)
+    parser.add_argument("--sky_radius_scale", type=float, default=1.25)
     parser.add_argument("--sam_variant", default="sam2", choices=["original", "mobile", "sam2"])
     parser.add_argument("--sam2_checkpoint", default="checkpoints/SAM 2.1 Hiera Large.pt")
     parser.add_argument("--use_full_scene_background", dest="use_full_scene_background", action="store_true")
     parser.add_argument("--no-full-scene-background", dest="use_full_scene_background", action="store_false")
-    parser.set_defaults(use_full_scene_background=True)
+    parser.set_defaults(use_full_scene_background=False)
     args = parser.parse_args()
 
     phi_bands = [float(x) for x in args.phi_bands.split(",") if x.strip()]
@@ -1449,6 +1829,7 @@ def main() -> None:
         frames_dir=args.frames_dir,
         n_views=args.n_views,
         phi_bands=phi_bands,
+        perspective_size=args.perspective_size,
         use_full_scene_background=args.use_full_scene_background,
         equirect_min_votes=args.equirect_min_votes,
         equirect_kernel_size=args.equirect_kernel_size,
@@ -1468,6 +1849,15 @@ def main() -> None:
         grounding_min_component_area_ratio=args.grounding_min_component_area_ratio,
         grounding_morph_open_kernel=args.grounding_morph_open_kernel,
         aggregate_by_label=args.aggregate_by_label,
+        fill_unassigned_layers=args.fill_unassigned_layers,
+        require_sky_layer=args.require_sky_layer,
+        sky_segmentation_backend=args.sky_segmentation_backend,
+        sky_segformer_model=args.sky_segformer_model,
+        sky_segformer_max_side=args.sky_segformer_max_side,
+        sky_segformer_threshold=args.sky_segformer_threshold,
+        sky_sphere_radius=args.sky_sphere_radius,
+        sky_radius_percentile=args.sky_radius_percentile,
+        sky_radius_scale=args.sky_radius_scale,
     )
 
 

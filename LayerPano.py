@@ -1,6 +1,7 @@
 
 import os
 import datetime
+import time
 import warnings
 from random import randint
 from loguru import logger
@@ -119,7 +120,7 @@ def _is_nonempty_training_image(image, min_nonzero_ratio: float = 1e-5) -> bool:
 
 
 class LayerPano:
-    def __init__(self, save_dir=None, backend="legacy", mps_rasterizer="cpp", quality="standard", max_points=None, downsample_ratio=0.1, disable_transfer=False, no_adaptive=False, repulsion_weight=1e-4, mean_lr_scale=1.0, mode="standard", early_stop_patience=None, early_stop_min_delta=0.0, lr_plateau_patience=None, lr_plateau_factor=0.5, lr_plateau_min_lr=1e-6):
+    def __init__(self, save_dir=None, backend="legacy", mps_rasterizer="cpp", quality="standard", max_points=None, downsample_ratio=0.1, training_image_size=None, layer_iterations=800, background_iterations=1000, sky_iterations=500, disable_transfer=False, no_adaptive=False, repulsion_weight=1e-4, mean_lr_scale=1.0, mode="standard", early_stop_patience=None, early_stop_min_delta=0.0, lr_plateau_patience=None, lr_plateau_factor=0.5, lr_plateau_min_lr=1e-6):
         self.init_logger()
         self.save_dir = save_dir
         self.opt = GSParams()
@@ -130,6 +131,10 @@ class LayerPano:
         self.quality = quality
         self.max_points = max_points
         self.downsample_ratio = downsample_ratio
+        self.training_image_size = training_image_size
+        self.layer_iterations = int(layer_iterations)
+        self.background_iterations = int(background_iterations)
+        self.sky_iterations = int(sky_iterations)
         self.disable_transfer = disable_transfer
         self.no_adaptive = no_adaptive
         self.repulsion_weight = repulsion_weight
@@ -303,10 +308,16 @@ class LayerPano:
         layer_order = []
         background_idx = None
         residual_idx = None
+        sky_idx = None
 
         if isinstance(meta, dict):
             background_idx = meta.get("background_layer_idx")
             residual_idx = meta.get("residual_layer_idx")
+            sky_idx = meta.get("sky_layer_idx")
+            if sky_idx is None and isinstance(meta.get("sky"), dict):
+                sky_idx = meta["sky"].get("layer_idx")
+            if sky_idx is not None:
+                sky_idx = int(sky_idx)
             instances = meta.get("instances", [])
 
             for item in instances:
@@ -347,15 +358,18 @@ class LayerPano:
 
         output_paths = []
         for layer_idx in layer_order:
+            layer_started = time.perf_counter()
             self.traindata = self.load_pcd_and_perspectives(input_dir, layer_idx)
 
             if self.quality == "test":
-                n_iterations = 400
+                n_iterations = 200
             else:
-                if background_idx is not None and layer_idx == background_idx:
-                    n_iterations = int(1600 * iter_scale)
+                if sky_idx is not None and layer_idx == sky_idx:
+                    n_iterations = int(self.sky_iterations * iter_scale)
+                elif background_idx is not None and layer_idx == background_idx:
+                    n_iterations = int(self.background_iterations * iter_scale)
                 else:
-                    n_iterations = int(1200 * iter_scale)
+                    n_iterations = int(self.layer_iterations * iter_scale)
 
             if self.backend == "splat-apple":
                 if not HAS_SPLAT_APPLE_BACKEND:
@@ -387,6 +401,11 @@ class LayerPano:
                     training_profile="layer_instances",
                 )
                 output_paths.append(outfile)
+                print(
+                    f"[timing] layer={layer_idx} iterations={n_iterations} "
+                    f"resolution={self.traindata['W']}x{self.traindata['H']} "
+                    f"elapsed={time.perf_counter() - layer_started:.1f}s"
+                )
                 continue
 
             raise RuntimeError("Instance layer mode requires the splat-apple MLX backend")
@@ -751,17 +770,52 @@ class LayerPano:
             pose_path = os.path.join(frames_dir, f'transform_matrix_{frame_idx}.npy')
             if not os.path.exists(rgb_path) or not os.path.exists(pose_path):
                 continue
-            pers_rgb = Image.open(rgb_path)
-            if not _is_nonempty_training_image(pers_rgb):
+            with Image.open(rgb_path) as image_handle:
+                pers_rgb = image_handle.convert("RGB").copy()
+            mask_path = os.path.join(frames_dir, f'mask_{frame_idx}.png')
+            if os.path.exists(mask_path):
+                with Image.open(mask_path) as mask_handle:
+                    supervision_mask = mask_handle.convert("L").copy()
+            else:
+                # Legacy traindata stored black outside each layer and had no
+                # explicit mask. Infer one so old scenes no longer supervise
+                # those black pixels during a retrain.
+                legacy_rgb = np.asarray(pers_rgb, dtype=np.uint8)
+                supervision_mask = Image.fromarray(
+                    (np.any(legacy_rgb > 0, axis=-1).astype(np.uint8) * 255),
+                    mode="L",
+                )
+            if self.training_image_size is not None and int(self.training_image_size) > 0:
+                max_side = max(pers_rgb.size)
+                if max_side > int(self.training_image_size):
+                    resize_scale = float(self.training_image_size) / float(max_side)
+                    resized = (
+                        max(1, int(round(pers_rgb.size[0] * resize_scale))),
+                        max(1, int(round(pers_rgb.size[1] * resize_scale))),
+                    )
+                    pers_rgb = pers_rgb.resize(resized, Image.Resampling.LANCZOS)
+                    supervision_mask = supervision_mask.resize(
+                        resized, Image.Resampling.NEAREST
+                    )
+            if not np.asarray(supervision_mask, dtype=np.uint8).any():
                 print(f"[INFO] Layer {idx}: skipping empty frame {fname}")
                 continue
             pose_gs = np.load(pose_path)
-            frames.append({'image': pers_rgb, 'transform_matrix': pose_gs})
+            frames.append({
+                'image': pers_rgb,
+                'mask': supervision_mask,
+                'transform_matrix': pose_gs,
+            })
 
         if not frames:
             raise RuntimeError(f'No non-empty frames found for layer {idx} in {frames_dir}')
         
         W, H = frames[-1]['image'].size
+        erp_height = None
+        erp_mask_path = os.path.join(load_dir, f"layer{idx}_erp_mask.png")
+        if os.path.exists(erp_mask_path):
+            with Image.open(erp_mask_path) as erp_mask_image:
+                erp_height = int(erp_mask_image.height)
 
         self.cam.W = W
         self.cam.H = H
@@ -775,6 +829,7 @@ class LayerPano:
             'fov': self.cam.fov_deg,
             'W': self.cam.W,
             'H': self.cam.H,
+            'erp_height': erp_height,
             'pcd_points': pcd_points,
             'pcd_colors': pcd_colors,
             'pcd_masks': pcd_masks,

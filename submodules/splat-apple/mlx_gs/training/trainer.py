@@ -50,7 +50,32 @@ def _align_image_pair(img1, img2):
 
     return img1, img2
 
-def loss_fn(params, target_image, camera, lambda_ssim, rasterizer_type, active_sh_degree: int = 1):
+
+def _align_mask(mask, reference):
+    if mask is None:
+        return None
+    if len(mask.shape) == 2:
+        mask = mask[None, ..., None]
+    elif len(mask.shape) == 3:
+        mask = mask[None, ...]
+    if len(reference.shape) == 3:
+        reference = reference[None, ...]
+    h = min(int(mask.shape[1]), int(reference.shape[1]))
+    w = min(int(mask.shape[2]), int(reference.shape[2]))
+    top = max((int(mask.shape[1]) - h) // 2, 0)
+    left = max((int(mask.shape[2]) - w) // 2, 0)
+    return mx.clip(mask[:, top:top + h, left:left + w, :1], 0.0, 1.0)
+
+
+def loss_fn(
+    params,
+    target_image,
+    camera,
+    lambda_ssim,
+    rasterizer_type,
+    active_sh_degree: int = 1,
+    target_mask=None,
+):
     """
     Computes loss for MLX value_and_grad.
     params is a dict or dataclass of MLX arrays.
@@ -59,8 +84,17 @@ def loss_fn(params, target_image, camera, lambda_ssim, rasterizer_type, active_s
 
     image, target_image = _align_image_pair(image, target_image)
 
-    l1 = l1_loss(image, target_image)
-    d_ssim = d_ssim_loss(image, target_image)
+    target_mask = _align_mask(target_mask, image)
+    if target_mask is None:
+        l1 = l1_loss(image, target_image)
+        d_ssim = d_ssim_loss(image, target_image)
+    else:
+        # Pixels outside a layer are unknown, not black. Mask both inputs
+        # before the structural term and normalize the pixel term only over
+        # supervised pixels, preventing dark halos at layer boundaries.
+        denom = mx.maximum(mx.sum(target_mask) * image.shape[-1], 1.0)
+        l1 = mx.sum(mx.abs(image - target_image) * target_mask) / denom
+        d_ssim = d_ssim_loss(image * target_mask, target_image * target_mask)
     loss = (1.0 - lambda_ssim) * l1 + lambda_ssim * d_ssim
     
     return loss, image
@@ -134,10 +168,20 @@ def train_step(
     repulsion_min_dist: float = 0.02,
     repulsion_max_samples: int = 512,
     active_sh_degree: int = 1,
+    target_mask=None,
 ):
     def wrapped_loss(p):
-        loss, image = loss_fn(p, target_image, camera, lambda_ssim, rasterizer_type, active_sh_degree=active_sh_degree)
+        loss, image = loss_fn(
+            p,
+            target_image,
+            camera,
+            lambda_ssim,
+            rasterizer_type,
+            active_sh_degree=active_sh_degree,
+            target_mask=target_mask,
+        )
         image, aligned_target_image = _align_image_pair(image, target_image)
+        aligned_target_mask = _align_mask(target_mask, image)
 
         if opacity_reg_weight > 0.0:
             op = p["opacities"] if isinstance(p, dict) else p.opacities
@@ -159,7 +203,15 @@ def train_step(
             loss = loss + scale_reg_weight * 0.1 * (1.0 / (scale_mean + 1e-6))
 
         if blur_reg_weight > 0.0:
-            loss = loss + blur_reg_weight * blur_aware_loss(image, aligned_target_image)
+            if aligned_target_mask is None:
+                loss = loss + blur_reg_weight * blur_aware_loss(
+                    image, aligned_target_image
+                )
+            else:
+                loss = loss + blur_reg_weight * blur_aware_loss(
+                    image * aligned_target_mask,
+                    aligned_target_image * aligned_target_mask,
+                )
 
         if repulsion_weight > 0.0:
             means = p["means"] if isinstance(p, dict) else p.means
@@ -184,7 +236,12 @@ def train_step(
     _clamp_params(params, scale_log_min, scale_log_max)
 
     rendered_image, target_image = _align_image_pair(rendered_image, target_image)
-    mse = mx.mean(mx.square(rendered_image - target_image))
+    target_mask = _align_mask(target_mask, rendered_image)
+    if target_mask is None:
+        mse = mx.mean(mx.square(rendered_image - target_image))
+    else:
+        denom = mx.maximum(mx.sum(target_mask) * rendered_image.shape[-1], 1.0)
+        mse = mx.sum(mx.square(rendered_image - target_image) * target_mask) / denom
     psnr = -10.0 * mx.log10(mx.maximum(mse, 1e-10))
 
     return loss, rendered_image, psnr, {}  # grad_norms vuoto, non sync

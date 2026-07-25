@@ -104,3 +104,7 @@ submodules/**/__pycache__/
 
 # Archived legacy workflows not needed for the default thesis pipeline
 legacy/
+
+# Local thesis manuscript and Overleaf export artifacts
+thesis_overleaf/
+ObjSplat_Thesis_*

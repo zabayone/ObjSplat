@@ -35,16 +35,75 @@ Useful overrides:
 OUT_DIR=outputs_mountain ./run_from_pano.sh
 GROUNDING_PROMPTS="sky . mountain . snow . house . railing . person" ./run_from_pano.sh
 CLEAN_OUTPUT=0 FORCE_RESEGMENT=0 ./run_from_pano.sh
+RETEXTURE_NIGHT_SKY=1 ./run_from_pano.sh
+OUT_DIR=outputs_park CLEAN_OUTPUT=0 FORCE_RESEGMENT=1 SEGMENT_ONLY=1 RETEXTURE_NIGHT_SKY=1 ./run_from_pano.sh
+OUT_DIR=outputs_park CLEAN_OUTPUT=0 MOOD_ONLY=1 BUILD_NIGHT_MOOD=1 ./run_from_pano.sh
 ```
+
+Generate the night-sky ERP after segmentation:
+
+```bash
+/opt/anaconda3/envs/layerpano3d/bin/python retexture_sky.py \
+  --scene_root outputs_mountain \
+  --model_path checkpoints/FLUX.1-Fill-dev
+```
+
+The command reads the original `rgb.png` and the canonical sky mask, applies
+FLUX Fill with circular horizontal context, and writes:
+
+- `traindata/sky/night_rgb.png`: masked night sky layer;
+- `traindata/sky/night_composite.png`: full ERP with non-sky pixels preserved;
+- `traindata/sky/night_generation.json`: reproducibility parameters and seam metrics.
+
+Use `--dry_run` to validate paths, mask coverage, and working resolution without
+loading the diffusion model. The same operation can be included in the main
+pipeline with `--retexture_night_sky`.
+
+With `RETEXTURE_NIGHT_SKY=1`, the full pipeline also relights non-sky pixels,
+fits the resulting ERP to the already trained Gaussian topology, and creates
+`scene/gsplat_scene_night.ply`. Geometry, scale, rotation, opacity, labels, and
+the number of points are preserved exactly; only SH appearance coefficients
+change. Optional `NIGHT_MOOD_REFINE_ITERS` performs a short SH-only refinement.
+It defaults to `0` because the analytic ERP fit is substantially faster for
+multi-gigabyte scenes.
+
+Switch variants without copying a PLY:
+
+```bash
+/opt/anaconda3/envs/layerpano3d/bin/python switch_mood.py \
+  --scene_root outputs_park --mood night
+```
+
+The active symlink is `scene/gsplat_scene_active.ply`. Use `--mood day` to
+switch back. If a day scene and night ERP already exist, `MOOD_ONLY=1` builds
+the night PLY without rerunning segmentation or day training.
+
+Run the inexpensive layer-data preflight independently:
+
+```bash
+/opt/anaconda3/envs/layerpano3d/bin/python validate_scene.py \
+  --scene_root outputs_park \
+  --require_sky
+```
+
+The default shell workflow uses a hybrid sky segmenter: lightweight
+`nvidia/segformer-b2-finetuned-ade-512-512` provides the semantic sky region,
+while high-resolution SAM masks protect trees, poles, roofs, and other thin
+foreground silhouettes. GroundingDINO + SAM2 remain responsible for the
+object-aware layers.
 
 ## Main Outputs
 
 - `traindata/layer_instances.json`: instance metadata, labels, scores, layer mapping, and coverage.
-- `traindata/layerK/`: masked frames and per-layer point clouds.
+- `traindata/layerK/`: full-color frames, explicit supervision masks, and per-layer point clouds.
 - `traindata/layer_mask_visualization.png`: panorama-level layer visualization.
+- `traindata/sky/mask.png` and `traindata/sky/day_rgb.png`: stable ERP inputs for sky retexturing.
 - `scene/gsplat_layerK.ply`: trained layer splats.
 - `scene/gsplat_scene_merged.ply`: merged scene.
 - `scene/gsplat_scene_merged_refined.ply`: optional conservative refinement.
+- `traindata/moods/night/scene_rgb.png`: night ERP including non-sky relighting.
+- `scene/gsplat_scene_night.ply`: night appearance with day geometry preserved.
+- `scene/moods.json` and `scene/gsplat_scene_active.ply`: mood manifest and active variant.
 
 ## Important Files
 
@@ -55,6 +114,17 @@ CLEAN_OUTPUT=0 FORCE_RESEGMENT=0 ./run_from_pano.sh
 - `mps_splat_backend.py`: MLX 3DGS training, adaptive topology, merge, and refinement logic.
 - `utils/semantic_instance_detection.py`: GroundingDINO + SAM/SAM2 detection and mask cleanup.
 - `utils/open_ply_in_supersplat.py`: helper to inspect PLY outputs in SuperSplat.
+
+For large local PLY files, open the scene through:
+
+```bash
+python utils/open_ply_in_supersplat.py outputs_lgs/scene/gsplat_scene_merged.ply
+```
+
+The helper serves real HTTP byte ranges (`206 Partial Content`) and streams
+them in bounded chunks. This avoids SuperSplat's whole-file memory fallback,
+which can exhaust the browser buffer on scenes containing millions of
+Gaussians.
 
 ## Useful Settings
 
@@ -72,11 +142,28 @@ Most defaults can be overridden through environment variables before running `ru
 | `GROUNDING_MORPH_OPEN_KERNEL` | `9` | Morphological cleanup kernel for thin mask artifacts. |
 | `GROUNDING_MIN_COMPONENT_AREA_RATIO` | `0.08` | Minimum detached component size kept after SAM cleanup. |
 | `MIN_POINTS_3D` | `1000` | Minimum projected 3D points required for a layer. |
+| `PERSPECTIVE_SIZE` | `1024` | Maximum side of generated perspective training views. |
+| `SKY_SEGMENTATION_BACKEND` | `hybrid` | Use SegFormer for sky and Grounding-SAM for object boundaries. |
+| `SKY_SEGFORMER_MAX_SIDE` | `2048` | Semantic sky inference resolution before restoring the ERP mask. |
 | `QUALITY` | `standard` | Training preset for 3DGS layers. |
-| `MAX_POINTS` | `0` | Per-layer gaussian cap; `0` disables the explicit cap. |
-| `GLOBAL_REFINE_ITERS` | `120` | Iterations for conservative opacity-only refinement. |
-| `CLEAN_OUTPUT` | `1` | Set `0` to reuse existing output artifacts. |
-| `FORCE_RESEGMENT` | `1` | Set `0` to reuse existing `traindata`. |
+| `MAX_POINTS` | `0` | Per-layer gaussian cap; `0` disables pruning and densification caps to preserve scene coverage. |
+| `TRAINING_IMAGE_SIZE` | `640` | Rasterized training side; source perspective frames remain at full resolution. |
+| `LAYER_ITERATIONS` | `800` | Standard object-layer iterations. |
+| `BACKGROUND_ITERATIONS` | `1000` | Background-layer iterations. |
+| `SKY_ITERATIONS` | `500` | Sky-layer iterations. |
+| `ADAPTIVE_TOPOLOGY` | `0` | Opt-in prune/clone/split; disabled by default to preserve ERP coverage. |
+| `GLOBAL_REFINE_ITERS` | `0` | Optional conservative opacity-only refinement. |
+| `CLEAN_OUTPUT` | `0` | Set `1` only for a deliberately clean rebuild; the default reuses expensive artifacts. |
+| `FORCE_RESEGMENT` | `0` | Set `1` when the panorama or segmentation configuration changed. |
+| `SEGMENT_ONLY` | `0` | Stop after segmentation and optional sky retexturing. |
+| `MOOD_ONLY` | `0` | Reuse segmentation and day PLY, generating only mood outputs. |
+| `RETEXTURE_NIGHT_SKY` | `0` | Generate canonical night-sky ERP assets before 3DGS training. |
+| `BUILD_NIGHT_MOOD` | same as `RETEXTURE_NIGHT_SKY` | Relight the rest of the scene and build the night PLY. |
+| `NIGHT_MOOD_REFINE_ITERS` | `0` | Optional SH-only night refinement iterations. |
+| `NIGHT_TRAINING_IMAGE_SIZE` | `512` | Raster size used only by optional night refinement. |
+| `SKY_MODEL_PATH` | `checkpoints/FLUX.1-Fill-dev` | Local Diffusers checkpoint used for sky filling. |
+| `SKY_STEPS` | `50` | FLUX Fill denoising steps. |
+| `SKY_MAX_PIXELS` | `1048576` | Maximum ERP working pixels before circular padding. |
 
 ## Checkpoints
 
@@ -84,7 +171,7 @@ Expected checkpoint paths are:
 
 - `checkpoints/SAM 2.1 Hiera Large.pt`
 - `checkpoints/sam_vit_h_4b8939.pth`
-- `checkpoints/groundingdino_swinb_cogvlm.pth`
+- Hugging Face cache entry for `IDEA-Research/grounding-dino-base`
 - `checkpoints/depth_anything_v2_vitl.pth`
 
 
@@ -95,6 +182,14 @@ The exact model files are not committed to the repository.
 ObjSplat is designed to make the reconstructed 3DGS scene inspectable and editable at object level. Instead of optimizing one monolithic scene, it separates detected semantic regions into layers, trains them independently, and merges them back into a unified object-aware representation.
 
 By default, same-label Grounding-SAM instances are aggregated into shared training layers to improve training signal, while each point keeps its original instance label.
+
+The default panoramic workflow requires a dedicated sky layer. Sky detections across the ERP seam are grouped together, preserved independently of generic object-size thresholds, and excluded from the full-scene background so a future day/night sky can be switched without leaving duplicate daytime gaussians. `layer_instances.json` exposes `sky_layer_idx` and canonical day/night ERP paths.
+
+Unassigned pixels are intentionally kept in the background instead of being
+forced into the nearest detected semantic layer. The legacy dense behavior is
+available only through `--fill_unassigned_layers`. The sky point cloud is
+placed on a derived far sphere rather than using unreliable monocular depth
+estimates for an effectively infinite surface.
 
 ## Credits
 

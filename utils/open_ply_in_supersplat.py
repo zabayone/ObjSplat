@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import functools
+import os
+import re
 import socket
 import subprocess
 import threading
@@ -65,6 +67,8 @@ def find_free_port() -> int:
 
 
 class QuietFileHandler(SimpleHTTPRequestHandler):
+    _byte_range: tuple[int, int] | None = None
+
     def log_message(self, format: str, *args) -> None:
         pass
 
@@ -72,6 +76,11 @@ class QuietFileHandler(SimpleHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header(
+            "Access-Control-Expose-Headers",
+            "Content-Range, Content-Length, Accept-Ranges",
+        )
+        self.send_header("Accept-Ranges", "bytes")
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
@@ -79,10 +88,82 @@ class QuietFileHandler(SimpleHTTPRequestHandler):
         self.send_response(204)
         self.end_headers()
 
+    def send_head(self):
+        """Serve a single byte range without buffering the complete PLY."""
+        self._byte_range = None
+        path = self.translate_path(self.path)
+        if os.path.isdir(path):
+            return super().send_head()
+        try:
+            source = open(path, "rb")
+        except OSError:
+            self.send_error(404, "File not found")
+            return None
+
+        try:
+            stat = os.fstat(source.fileno())
+            size = int(stat.st_size)
+            content_type = self.guess_type(path)
+            range_header = self.headers.get("Range")
+            if range_header:
+                match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+                if match is None:
+                    self.send_error(416, "Only one byte range is supported")
+                    source.close()
+                    return None
+                first, last = match.groups()
+                if first:
+                    start = int(first)
+                    end = int(last) if last else size - 1
+                elif last:
+                    suffix_length = int(last)
+                    start = max(0, size - suffix_length)
+                    end = size - 1
+                else:
+                    self.send_error(416, "Invalid byte range")
+                    source.close()
+                    return None
+                if start >= size or start < 0 or end < start:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.end_headers()
+                    source.close()
+                    return None
+                end = min(end, size - 1)
+                self._byte_range = (start, end)
+                self.send_response(206)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.send_header("Content-Length", str(end - start + 1))
+                self.send_header("Last-Modified", self.date_time_string(stat.st_mtime))
+                self.end_headers()
+                source.seek(start)
+                return source
+
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Last-Modified", self.date_time_string(stat.st_mtime))
+            self.end_headers()
+            return source
+        except Exception:
+            source.close()
+            raise
+
     def copyfile(self, source, outputfile):
         try:
-            super().copyfile(source, outputfile)
-        except BrokenPipeError:
+            if self._byte_range is None:
+                super().copyfile(source, outputfile)
+                return
+            start, end = self._byte_range
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = source.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                outputfile.write(chunk)
+                remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
             pass
 
 
@@ -90,14 +171,14 @@ def start_viewer_if_needed() -> subprocess.Popen[str] | None:
     if not (GUI_DIR / "package.json").exists():
         raise FileNotFoundError(f"Cannot find SuperSplat GUI project at {GUI_DIR}")
 
+    if is_http_ready(VIEWER_URL):
+        return None
+
     subprocess.run(
         ["npm", "run", "build"],
         cwd=str(GUI_DIR),
         check=True,
     )
-
-    if is_http_ready(VIEWER_URL):
-        return None
 
     return subprocess.Popen(
         ["npm", "run", "serve"],

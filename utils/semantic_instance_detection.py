@@ -45,7 +45,7 @@ class SemanticInstanceDetector:
     def __init__(self, checkpoint_path: str = "checkpoints/sam_vit_h_4b8939.pth", 
                  device: str = "mps", 
                  use_grounding: bool = True,
-                 grounding_checkpoint: str = "checkpoints/groundingdino_swinb_cogvlm.pth"):
+                 grounding_checkpoint: str = "IDEA-Research/grounding-dino-base"):
         """Initialize SAM model for instance detection.
         
         Args:
@@ -284,7 +284,7 @@ def detect_objects_in_layer(
     device: str = "mps",
     min_area: int = 100,
     use_grounding: bool = True,
-    grounding_checkpoint: str = "checkpoints/groundingdino_swinb_cogvlm.pth",
+    grounding_checkpoint: str = "IDEA-Research/grounding-dino-base",
 ) -> Tuple[np.ndarray, Optional[Dict[int, str]]]:
     """Detect semantic objects in a layer using SAM + optional GroundingDINO.
     
@@ -408,7 +408,7 @@ def detect_objects_grounding_then_sam_on_panorama(
     sam_checkpoint: str = "checkpoints/sam_vit_h_4b8939.pth",
     device: str = "mps",
     use_grounding: bool = True,
-    grounding_checkpoint: str = "checkpoints/groundingdino_swinb_cogvlm.pth",
+    grounding_checkpoint: str = "IDEA-Research/grounding-dino-base",
     sam_variant: str = "original",
     grounding_prompts: Optional[str] = None,
     box_threshold: float = 0.25,
@@ -442,6 +442,8 @@ def detect_objects_grounding_then_sam_on_panorama(
     proc = None
     gmodel = None
     det_boxes: List[Tuple[np.ndarray, str, float]] = []
+    grounding_error: Optional[str] = None
+    grounding_succeeded = False
     if use_grounding and GROUNDING_DINO_AVAILABLE:
         try:
             model_id = "IDEA-Research/grounding-dino-base"
@@ -498,8 +500,12 @@ def detect_objects_grounding_then_sam_on_panorama(
                         continue
                     score = float(scores[idx].detach().cpu().item()) if idx < len(scores) and hasattr(scores[idx], "detach") else 0.0
                     det_boxes.append((np.array([x1, y1, x2, y2], dtype=np.float32), str(l).strip() or "unknown", score))
+            grounding_succeeded = bool(det_boxes)
         except Exception as e:
             print(f"[WARN] GroundingDINO failed: {e}")
+            grounding_error = str(e)
+    elif use_grounding:
+        grounding_error = "transformers GroundingDINO support is unavailable"
 
     if not det_boxes:
         det_boxes = [(np.array([0, 0, w, h], dtype=np.float32), "panorama", 0.0)]
@@ -610,15 +616,23 @@ def detect_objects_grounding_then_sam_on_panorama(
             best_idx = int(np.argmax(areas)) + 1
         return labels == best_idx
 
-    def _clean_prompt_mask(mask: np.ndarray, box: np.ndarray) -> np.ndarray:
+    def _clean_prompt_mask(mask: np.ndarray, box: np.ndarray, label: str) -> np.ndarray:
+        label_norm = str(label).strip().lower()
+        if "sky" in {part for part in label_norm.replace("/", " ").split() if part}:
+            # GroundingDINO boxes are often much tighter than the actual sky,
+            # especially on 2:1 ERPs. SAM already predicts the semantic region;
+            # clipping it back to the detection box collapses the sky to a
+            # narrow strip and destroys gaps between vegetation.
+            return np.asarray(mask, dtype=bool)
         expanded_box = _expand_box(box, w, h, box_padding_ratio)
         clipped = _mask_inside_box(mask, expanded_box)
         clipped = _keep_significant_component(clipped, box)
-        return _mask_inside_box(clipped, box)
+        return _mask_inside_box(clipped, expanded_box)
 
     def _mask_priority(record: Tuple[np.ndarray, str, float]) -> Tuple[int, int, float]:
         mask, label, score = record
         label_norm = str(label).strip().lower()
+        label_tokens = {part for part in label_norm.replace("/", " ").split() if part}
         stuff_labels = {
             "sky",
             "road",
@@ -631,9 +645,14 @@ def detect_objects_grounding_then_sam_on_panorama(
             "wall",
             "building",
         }
-        is_stuff = int(any(token in label_norm for token in stuff_labels))
+        if "sky" in label_tokens:
+            semantic_priority = 1
+        elif any(token in label_norm for token in stuff_labels):
+            semantic_priority = 2
+        else:
+            semantic_priority = 0
         area = int(np.asarray(mask, dtype=bool).sum())
-        return (is_stuff, area, -float(score))
+        return (semantic_priority, area, -float(score))
 
     def _resolve_sam2_config(checkpoint_path: str) -> str:
         if sam2_config:
@@ -661,7 +680,7 @@ def detect_objects_grounding_then_sam_on_panorama(
             for box, label, det_score in det_boxes:
                 masks, scores, _ = predictor.predict(box=box[None, :], multimask_output=bool(multimask_output))
                 best_idx = int(np.argmax(scores)) if len(scores) else 0
-                mask = _clean_prompt_mask(masks[best_idx].astype(bool), box)
+                mask = _clean_prompt_mask(masks[best_idx].astype(bool), box, label)
                 records.append((mask, label, float(scores[best_idx]) if len(scores) else det_score))
             return records
 
@@ -680,14 +699,20 @@ def detect_objects_grounding_then_sam_on_panorama(
         for box, label, det_score in det_boxes:
             masks, scores, _ = predictor.predict(box=box, multimask_output=bool(multimask_output))
             best_idx = int(np.argmax(scores)) if len(scores) else 0
-            mask = _clean_prompt_mask(masks[best_idx].astype(bool), box)
+            mask = _clean_prompt_mask(masks[best_idx].astype(bool), box, label)
             records.append((mask, label, float(scores[best_idx]) if len(scores) else det_score))
         return records
 
+    sam_error: Optional[str] = None
+    sam_succeeded = False
     try:
         mask_records = _predict_box_masks()
+        sam_succeeded = bool(mask_records)
+        if not sam_succeeded:
+            raise RuntimeError("SAM returned no masks")
     except Exception as e:
         print(f"[WARN] SAM box prompting failed, falling back to full-panorama mask: {e}")
+        sam_error = str(e)
         mask_records = [(np.ones((h, w), dtype=bool), "panorama-fallback", 0.0)]
 
     instance_map = np.zeros((h, w), dtype=np.int32)
@@ -695,7 +720,9 @@ def detect_objects_grounding_then_sam_on_panorama(
     tags: Dict[int, str] = {}
     scores_out: Dict[int, float] = {}
 
-    # Write smaller foreground regions first, then large stuff/layout regions such as sky and road.
+    # Reserve foreground first, then sky, then ground/layout regions. This
+    # prevents broad road masks from consuming sky pixels while preserving
+    # object silhouettes in front of the sky.
     mask_records = sorted(mask_records, key=_mask_priority)
     next_id = 1
     for mask, label, score in mask_records:
@@ -726,4 +753,15 @@ def detect_objects_grounding_then_sam_on_panorama(
             {"box": box.tolist(), "label": label, "score": float(score)}
             for box, label, score in det_boxes
         ],
+        "grounding_status": {
+            "requested": bool(use_grounding),
+            "available": bool(GROUNDING_DINO_AVAILABLE),
+            "succeeded": bool(grounding_succeeded),
+            "error": grounding_error,
+        },
+        "sam_status": {
+            "variant": str(sam_variant),
+            "succeeded": bool(sam_succeeded),
+            "error": sam_error,
+        },
     }
