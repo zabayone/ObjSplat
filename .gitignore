@@ -60,11 +60,22 @@ GUI/.rollup.cache/
 
 # Pipeline outputs and generated data
 outputs*/
+benchmark_results/
+benchmark_work/
 outputs_lgs/
 results/
 logs/
 layering/
 debug/
+
+# Local evaluation datasets (keep only the convention/documentation)
+benchmark/evaluation/*
+!benchmark/evaluation/README.md
+!benchmark/evaluation/.gitkeep
+
+# Document render/QA intermediates
+docs/_docx_qa/
+docs/*.pdf
 
 # Model checkpoints and ML weights
 checkpoints/*

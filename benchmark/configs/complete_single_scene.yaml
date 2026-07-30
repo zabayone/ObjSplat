@@ -1,0 +1,44 @@
+experiment_name: complete_single_scene
+output_root: benchmark_results
+scenes:
+  - name: thesis_scene
+    scene_root: benchmark_work/thesis_scene
+    input_panorama: path/to/panorama.png
+rerun_segmentation: true
+retrain: true
+reuse_existing_outputs: false
+run_monolithic_baseline: true
+run_quality_evaluation: true
+run_rendering_benchmark: true
+run_edit_locality: true
+run_mood_evaluation: true
+random_seed: 42
+resource_sampling_interval: 1.0
+splits:
+  training_fraction: 0.8
+  evaluation_fraction: 0.2
+rendering:
+  width: 512
+  height: 512
+  warmup_frames: 5
+  measured_frames: 30
+  rasterizer: cpp
+monolithic:
+  iterations: 1000
+  image_size: 640
+  rasterizer: cpp
+  adaptive_topology: false
+selected_layers: [0]
+selected_instances: []
+pipeline_args:
+  - --use_grounding_dino
+  - --aggregate_by_label
+  - --require_sky_layer
+  - --quality
+  - standard
+  - --layer_iterations
+  - "800"
+  - --background_iterations
+  - "1000"
+  - --sky_iterations
+  - "500"

@@ -17,10 +17,11 @@ from PIL import Image
 
 DEFAULT_NIGHT_PROMPT = (
     "Transform only the masked daytime sky into a photorealistic clear night sky, "
-    "deep natural blue tones, subtle physically plausible stars, consistent horizon "
-    "glow, preserve the exact skyline and cloud geometry, seamless 360 panorama, "
-    "uniform exposure, continuous sky texture, no horizontal streaks, no bands, "
-    "no aurora, no buildings, no landscape, no text"
+    "deep natural blue tones, a visible realistic star field with many small "
+    "stars in the upper sky, subtle physically plausible stars, consistent "
+    "horizon glow, preserve the exact skyline and cloud geometry, seamless 360 "
+    "panorama, uniform exposure, continuous sky texture, no horizontal streaks, "
+    "no bands, no aurora, no buildings, no landscape, no text"
 )
 
 
@@ -71,6 +72,15 @@ class SkyRetextureConfig:
     circular_padding_ratio: float = 0.0625
     seam_blend_px: int = 32
     min_sky_coverage: float = 0.005
+    star_density: float = 0.00065
+    star_luma_threshold: int = 145
+    star_max_row_ratio: float = 0.58
+    star_radius_px: int = 1
+    sky_luma_cap: float = 0.42
+    sky_hotspot_ratio: float = 1.55
+    sky_hotspot_blur_fraction: float = 0.06
+    sky_hotspot_strength: float = 0.85
+    vae_tiling: bool = False
     device: str = "mps"
     cpu_offload: bool = True
     validate_checkpoint: bool = True
@@ -195,7 +205,11 @@ def _load_pipeline(config: SkyRetextureConfig):
         local_files_only=True,
     )
     pipe.enable_vae_slicing()
-    pipe.enable_vae_tiling()
+    if config.vae_tiling:
+        pipe.enable_vae_tiling()
+        print("[SkyRetexture] VAE tiling enabled; tiled decoding may introduce texture bands")
+    elif hasattr(pipe, "disable_vae_tiling"):
+        pipe.disable_vae_tiling()
     if hasattr(pipe, "enable_attention_slicing"):
         try:
             pipe.enable_attention_slicing("max")
@@ -271,6 +285,166 @@ def _harmonize_erp_seam(
     return np.clip(np.rint(out), 0, 255).astype(np.uint8)
 
 
+def _compress_sky_hotspots(
+    image: np.ndarray,
+    sky_mask: np.ndarray,
+    config: SkyRetextureConfig,
+) -> tuple[np.ndarray, dict]:
+    """Compress broad night-sky hotspots without flattening local texture."""
+    out = np.asarray(image, dtype=np.uint8)
+    mask = np.asarray(sky_mask, dtype=bool)
+    if not mask.any() or float(config.sky_luma_cap) <= 0:
+        return out.copy(), {"adjusted_pixels": 0}
+
+    rgb = out.astype(np.float32) / 255.0
+    luma = np.sum(
+        rgb * np.array([0.2126, 0.7152, 0.0722], dtype=np.float32),
+        axis=-1,
+    )
+    h, w = mask.shape
+    sigma_x = max(2.0, float(config.sky_hotspot_blur_fraction) * w)
+    sigma_y = max(2.0, sigma_x * 0.35)
+    pad = min(w // 4, max(8, int(round(3.0 * sigma_x))))
+    mask_f = mask.astype(np.float32)
+    weighted = luma * mask_f
+    wrapped_weighted = np.concatenate(
+        [weighted[:, -pad:], weighted, weighted[:, :pad]],
+        axis=1,
+    )
+    wrapped_mask = np.concatenate(
+        [mask_f[:, -pad:], mask_f, mask_f[:, :pad]],
+        axis=1,
+    )
+    local_luma = cv2.GaussianBlur(
+        wrapped_weighted,
+        (0, 0),
+        sigmaX=sigma_x,
+        sigmaY=sigma_y,
+        borderType=cv2.BORDER_REFLECT,
+    )[:, pad:pad + w]
+    local_weight = cv2.GaussianBlur(
+        wrapped_mask,
+        (0, 0),
+        sigmaX=sigma_x,
+        sigmaY=sigma_y,
+        borderType=cv2.BORDER_REFLECT,
+    )[:, pad:pad + w]
+    local_luma /= np.maximum(local_weight, 1e-5)
+
+    reference = float(np.median(local_luma[mask]))
+    relative_cap = max(reference + 0.02, reference * float(config.sky_hotspot_ratio))
+    cap = min(float(config.sky_luma_cap), relative_cap)
+    affected = mask & (local_luma > cap)
+    if not affected.any():
+        return out.copy(), {
+            "adjusted_pixels": 0,
+            "reference_luma": reference,
+            "effective_luma_cap": cap,
+        }
+
+    gain = np.ones_like(local_luma, dtype=np.float32)
+    raw_gain = cap / np.maximum(local_luma, 1e-5)
+    gain[affected] = np.power(
+        np.clip(raw_gain[affected], 0.25, 1.0),
+        float(config.sky_hotspot_strength),
+    )
+    corrected = rgb.copy()
+    corrected[mask] *= gain[mask, None]
+    corrected = np.clip(corrected * 255.0 + 0.5, 0, 255).astype(np.uint8)
+    return corrected, {
+        "adjusted_pixels": int(affected.sum()),
+        "reference_luma": reference,
+        "effective_luma_cap": cap,
+        "minimum_gain": float(gain[affected].min()),
+    }
+
+
+def _add_procedural_stars(
+    image: np.ndarray,
+    sky_mask: np.ndarray,
+    config: SkyRetextureConfig,
+) -> tuple[np.ndarray, int]:
+    """Add a sparse star field to the upper dark sky while keeping the mask exact."""
+    out = np.asarray(image, dtype=np.uint8).copy()
+    sky_mask = np.asarray(sky_mask, dtype=bool)
+    if not sky_mask.any():
+        return out, 0
+
+    h, w = out.shape[:2]
+    gray = cv2.cvtColor(out, cv2.COLOR_RGB2GRAY)
+    upper_limit = max(1, int(round(h * float(config.star_max_row_ratio))))
+    candidate_mask = sky_mask.copy()
+    candidate_mask[upper_limit:, :] = False
+    candidate_mask &= gray <= int(config.star_luma_threshold)
+
+    candidates = np.argwhere(candidate_mask)
+    if candidates.size == 0:
+        return out, 0
+
+    density = max(0.0, float(config.star_density))
+    target = int(round(float(candidates.shape[0]) * density))
+    target = max(0, min(target, 900))
+    if target <= 0:
+        return out, 0
+
+    rng = np.random.default_rng(int(config.seed) ^ 0x6D2B79F5)
+    # ERP rows oversample the poles. Weight by spherical area so the resulting
+    # star field remains uniform when viewed as a sphere.
+    spherical_weights = np.sin(
+        np.pi * (candidates[:, 0].astype(np.float64) + 0.5) / float(h)
+    )
+    darkness = 1.0 - gray[candidates[:, 0], candidates[:, 1]].astype(np.float64) / 255.0
+    weights = np.maximum(1e-8, spherical_weights * np.square(darkness))
+    weights /= weights.sum()
+    indices = rng.choice(
+        candidates.shape[0],
+        size=min(target, candidates.shape[0]),
+        replace=False,
+        p=weights,
+    )
+    star_points = candidates[indices]
+
+    rgb = out.astype(np.float32) / 255.0
+    radius_scale = max(0.5, float(config.star_radius_px))
+    star_count = 0
+    for y, x in star_points:
+        if not sky_mask[y, x]:
+            continue
+        magnitude_sample = float(rng.random())
+        peak = 0.10 + 0.78 * magnitude_sample**6
+        sigma = radius_scale * (0.34 + 0.48 * magnitude_sample**3)
+        radius = max(1, int(math.ceil(3.0 * sigma)))
+        y0 = max(0, int(y) - radius)
+        y1 = min(h, int(y) + radius + 1)
+        x0 = max(0, int(x) - radius)
+        x1 = min(w, int(x) + radius + 1)
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        subpixel_x = float(x) + float(rng.uniform(-0.45, 0.45))
+        subpixel_y = float(y) + float(rng.uniform(-0.45, 0.45))
+        psf = np.exp(
+            -(
+                np.square(xx - subpixel_x) + np.square(yy - subpixel_y)
+            )
+            / (2.0 * sigma * sigma)
+        ).astype(np.float32)
+        if rng.random() < 0.32:
+            color = np.array([0.78, 0.88, 1.0], dtype=np.float32)
+        elif rng.random() < 0.20:
+            color = np.array([1.0, 0.90, 0.76], dtype=np.float32)
+        else:
+            color = np.array([0.96, 0.97, 1.0], dtype=np.float32)
+        patch_mask = sky_mask[y0:y1, x0:x1]
+        addition = psf[..., None] * peak * color
+        rgb[y0:y1, x0:x1] = np.where(
+            patch_mask[..., None],
+            np.clip(rgb[y0:y1, x0:x1] + addition, 0.0, 1.0),
+            rgb[y0:y1, x0:x1],
+        )
+        star_count += 1
+
+    return np.clip(rgb * 255.0 + 0.5, 0, 255).astype(np.uint8), star_count
+
+
 def retexture_sky(
     scene_root: str | Path,
     config: SkyRetextureConfig,
@@ -338,6 +512,8 @@ def retexture_sky(
         mask,
         band_px=config.seam_blend_px,
     )
+    composite, hotspot_report = _compress_sky_hotspots(composite, mask, config)
+    composite, star_count = _add_procedural_stars(composite, mask, config)
     night_layer = np.zeros_like(composite)
     night_layer[mask] = composite[mask]
 
@@ -356,6 +532,8 @@ def retexture_sky(
         "seam_mae_before": _seam_error(source, mask),
         "seam_mae_generated": seam_before_harmonization,
         "seam_mae_after": _seam_error(composite, mask),
+        "sky_hotspot_compression": hotspot_report,
+        "procedural_star_count": int(star_count),
         "night_layer_path": str(layer_path.relative_to(scene_root)),
         "night_composite_path": str(composite_path.relative_to(scene_root)),
     }

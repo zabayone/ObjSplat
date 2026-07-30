@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import shutil
 import time
 from pathlib import Path
@@ -20,6 +21,24 @@ from mps_splat_backend import (
     merge_ply_layers,
     mood_refine_after_merge,
 )
+from benchmark.runtime_hooks import pipeline_stage, record_stage
+
+
+def _seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+    except (AttributeError, ImportError, RuntimeError):
+        pass
+    try:
+        import mlx.core as mx
+
+        mx.random.seed(seed)
+    except (AttributeError, ImportError, RuntimeError):
+        pass
 
 
 def _load_metadata(path: Path) -> dict:
@@ -63,11 +82,27 @@ def _clear_existing_layer_outputs(save_root: Path) -> None:
     if moods_dir.exists():
         shutil.rmtree(moods_dir)
     scene_dir = save_root / "scene"
-    for name in [
-        "gsplat_scene_night.ply",
-        "gsplat_scene_active.ply",
-        "moods.json",
-    ]:
+    mood_manifest = scene_dir / "moods.json"
+    if mood_manifest.exists():
+        try:
+            manifest = _load_metadata(mood_manifest)
+            for mood_name, entry in (manifest.get("moods") or {}).items():
+                if mood_name == "day" or not entry.get("ply_path"):
+                    continue
+                candidate = (save_root / str(entry["ply_path"])).resolve()
+                if (
+                    candidate.parent == scene_dir.resolve()
+                    and candidate.name.startswith("gsplat_scene_")
+                    and candidate.name not in {
+                        "gsplat_scene_merged.ply",
+                        "gsplat_scene_merged_refined.ply",
+                    }
+                    and candidate.exists()
+                ):
+                    candidate.unlink()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    for name in ["gsplat_scene_active.ply", "moods.json"]:
         candidate = scene_dir / name
         if candidate.is_symlink() or candidate.exists():
             candidate.unlink()
@@ -91,9 +126,19 @@ def _load_full_scene_refine_frames(
 ) -> list[dict]:
     frames_dir = frames_dir or input_root / "traindata" / "perspective_frames" / "frames"
     frame_paths = sorted(frames_dir.glob("rgb_*.png"), key=_numeric_suffix_key)
+    excluded_indices: set[int] = set()
+    metadata_path = input_root / "traindata" / "layer_instances.json"
+    if metadata_path.exists() and frames_dir == input_root / "traindata" / "perspective_frames" / "frames":
+        try:
+            split = (_load_metadata(metadata_path).get("benchmark_view_split") or {})
+            excluded_indices = {int(value) for value in split.get("evaluation_indices", [])}
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            excluded_indices = set()
     frames = []
     for rgb_path in frame_paths:
         idx, _stem = _numeric_suffix_key(rgb_path)
+        if idx in excluded_indices:
+            continue
         pose_path = frames_dir / f"transform_matrix_{idx}.npy"
         if idx < 0 or not pose_path.exists():
             continue
@@ -121,15 +166,16 @@ def _load_full_scene_refine_frames(
     return frames
 
 
-def _build_night_gaussian_mood(
+def _build_gaussian_mood(
     *,
     args,
     save_root: str,
     save_scene: str,
     metadata_path: Path,
     day_ply: Path,
-    night_scene_erp: Path,
-    night_mood_config,
+    mood_name: str,
+    mood_scene_erp: Path,
+    mood_config,
 ) -> Path:
     from switch_mood import switch_mood
     from utils.mood_adaptation import (
@@ -143,47 +189,50 @@ def _build_night_gaussian_mood(
         sky_meta.get("mask_path", "traindata/sky/mask.png")
     )
     sky_radius = float(((sky_meta.get("geometry") or {}).get("radius") or 0.0))
-    night_ply = Path(save_scene) / "gsplat_scene_night.ply"
-    print("[pipeline] Fitting night ERP colors to the existing Gaussian topology")
-    mood_fit_started = time.perf_counter()
-    fit_report = adapt_gaussian_ply_to_erp(
-        source_ply=day_ply,
-        target_ply=night_ply,
-        target_erp_path=night_scene_erp,
-        sky_mask_path=sky_mask_path,
-        config=night_mood_config,
-        sky_radius=sky_radius,
-    )
+    mood_ply = Path(save_scene) / f"gsplat_scene_{mood_name}.ply"
     print(
-        f"[timing] night analytic fit elapsed="
+        f"[pipeline] Fitting {mood_name} ERP colors to the existing Gaussian topology"
+    )
+    mood_fit_started = time.perf_counter()
+    with pipeline_stage("analytic_day_to_mood_gaussian_fitting"):
+        fit_report = adapt_gaussian_ply_to_erp(
+            source_ply=day_ply,
+            target_ply=mood_ply,
+            target_erp_path=mood_scene_erp,
+            sky_mask_path=sky_mask_path,
+            config=mood_config,
+            sky_radius=sky_radius,
+        )
+    print(
+        f"[timing] {mood_name} analytic fit elapsed="
         f"{time.perf_counter() - mood_fit_started:.1f}s"
     )
 
-    if args.night_mood_refine_iters > 0:
-        night_frames_dir = (
-            Path(save_root) / "traindata" / "moods" / "night" / "frames"
+    if args.mood_refine_iters > 0:
+        mood_frames_dir = (
+            Path(save_root) / "traindata" / "moods" / mood_name / "frames"
         )
-        if night_frames_dir.exists():
-            shutil.rmtree(night_frames_dir)
-        night_phi_bands = [
+        if mood_frames_dir.exists():
+            shutil.rmtree(mood_frames_dir)
+        mood_phi_bands = [
             float(value)
-            for value in args.night_phi_bands.split(",")
+            for value in args.mood_phi_bands.split(",")
             if value.strip()
         ]
-        night_rgb = np.asarray(
-            Image.open(night_scene_erp).convert("RGB"), dtype=np.uint8
+        mood_rgb = np.asarray(
+            Image.open(mood_scene_erp).convert("RGB"), dtype=np.uint8
         )
         _generate_frames(
-            night_rgb,
-            night_frames_dir,
-            n=args.night_n_views,
-            phi_bands=night_phi_bands,
-            perspective_size=args.night_training_image_size,
+            mood_rgb,
+            mood_frames_dir,
+            n=args.mood_n_views,
+            phi_bands=mood_phi_bands,
+            perspective_size=args.mood_training_image_size,
         )
         mood_frames = _load_full_scene_refine_frames(
             Path(save_root),
-            max_image_size=args.night_training_image_size,
-            frames_dir=night_frames_dir,
+            max_image_size=args.mood_training_image_size,
+            frames_dir=mood_frames_dir,
         )
         first_w, first_h = mood_frames[0]["image"].size
         mood_traindata = {
@@ -196,21 +245,24 @@ def _build_night_gaussian_mood(
             "pcd_labels": np.zeros((1,), dtype=np.int32),
             "frames": mood_frames,
         }
-        refined_night = night_ply.with_name(".gsplat_scene_night_refining.ply")
-        mood_refine_after_merge(
-            traindata=mood_traindata,
-            initial_ply_path=str(night_ply),
-            out_ply_path=str(refined_night),
-            num_iterations=args.night_mood_refine_iters,
-            rasterizer=args.mps_rasterizer,
-            device=args.device,
+        refined_mood = mood_ply.with_name(
+            f".gsplat_scene_{mood_name}_refining.ply"
         )
-        os.replace(refined_night, night_ply)
+        with pipeline_stage("optional_mood_refinement", iterations=args.mood_refine_iters):
+            mood_refine_after_merge(
+                traindata=mood_traindata,
+                initial_ply_path=str(mood_ply),
+                out_ply_path=str(refined_mood),
+                num_iterations=args.mood_refine_iters,
+                rasterizer=args.mps_rasterizer,
+                device=args.device,
+            )
+        os.replace(refined_mood, mood_ply)
 
     scene_root_path = Path(save_root).resolve()
     try:
         day_relative = str(day_ply.resolve().relative_to(scene_root_path))
-        night_relative = str(night_ply.resolve().relative_to(scene_root_path))
+        mood_relative = str(mood_ply.resolve().relative_to(scene_root_path))
     except ValueError as exc:
         raise ValueError("Mood PLY outputs must be inside the scene root") from exc
     write_mood_manifest(
@@ -222,20 +274,25 @@ def _build_night_gaussian_mood(
                     "ply_path": day_relative,
                     "geometry_source": day_relative,
                 },
-                "night": {
-                    "ply_path": night_relative,
+                mood_name: {
+                    "ply_path": mood_relative,
                     "geometry_source": day_relative,
                     "scene_erp_path": str(
-                        Path(night_scene_erp).resolve().relative_to(scene_root_path)
+                        Path(mood_scene_erp).resolve().relative_to(scene_root_path)
                     ),
+                    "circumplex": {
+                        "valence": float(mood_config.valence),
+                        "arousal": float(mood_config.arousal),
+                    },
+                    "time_of_day": mood_config.time_of_day,
                     "fit": fit_report,
-                    "refine_iterations": int(args.night_mood_refine_iters),
+                    "refine_iterations": int(args.mood_refine_iters),
                 },
             },
         },
     )
     switch_mood(scene_root_path, "day")
-    return night_ply
+    return mood_ply
 
 
 def main() -> None:
@@ -249,6 +306,12 @@ def main() -> None:
     parser.add_argument("--target_scene_scale", type=float, default=0.5,
                         help="Target scene std (used when --auto_depth_scale enabled)")
     parser.add_argument("--device", default="mps")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Seed shared by Python, NumPy, Torch, and MLX",
+    )
     parser.add_argument("--sam_checkpoint", default="checkpoints/sam_vit_h_4b8939.pth")
     parser.add_argument("--min_frame_area", type=int, default=2000)
     parser.add_argument("--min_frames", type=int, default=3)
@@ -310,6 +373,11 @@ def main() -> None:
     parser.add_argument("--phi_bands", default="45,0,-45", help="Comma-separated phi bands in degrees")
     parser.add_argument("--perspective_size", type=int, default=1024,
                         help="Maximum square resolution of generated perspective training views")
+    parser.add_argument(
+        "--benchmark_eval_fraction", type=float, default=0.0,
+        help="Deterministically exclude this fraction of perspective views from 3DGS training",
+    )
+    parser.add_argument("--benchmark_split_seed", type=int, default=42)
     parser.add_argument("--use_grounding_dino", action="store_true", help="Enable GroundingDINO proposals + tagging")
     parser.add_argument("--grounding_dino_checkpoint", default="IDEA-Research/grounding-dino-base")
     parser.add_argument("--grounding_prompts", default=None,
@@ -320,15 +388,15 @@ def main() -> None:
     parser.add_argument("--grounding_mask_min_area", type=int, default=1500)
     parser.add_argument("--grounding_single_mask", action="store_true",
                         help="Use SAM's best single mask per GroundingDINO box")
-    parser.add_argument("--grounding_box_padding", type=float, default=0.15,
+    parser.add_argument("--grounding_box_padding", type=float, default=0.12,
                         help="Padding ratio used to clip SAM masks around each GroundingDINO box")
     parser.add_argument("--grounding_infer_max_side", type=int, default=1024,
                         help="Max panorama side used for GroundingDINO inference")
     parser.add_argument("--grounding_exclude_labels", default=None,
                         help="Optional comma-separated labels to exclude from object layers")
-    parser.add_argument("--grounding_min_component_area_ratio", type=float, default=0.02,
+    parser.add_argument("--grounding_min_component_area_ratio", type=float, default=0.01,
                         help="Drop detached SAM mask components smaller than this fraction of total mask area")
-    parser.add_argument("--grounding_morph_open_kernel", type=int, default=5,
+    parser.add_argument("--grounding_morph_open_kernel", type=int, default=3,
                         help="Opening kernel used to remove thin detached mask artifacts; set 0 to disable")
     parser.add_argument("--aggregate_by_label", action="store_true",
                         help="Group same-label Grounding-SAM instances into shared training layers while preserving instance labels")
@@ -358,12 +426,37 @@ def main() -> None:
     parser.add_argument("--sky_mask_feather_px", type=int, default=9)
     parser.add_argument("--sky_circular_padding_ratio", type=float, default=0.0625)
     parser.add_argument("--sky_min_coverage", type=float, default=0.005)
+    parser.add_argument("--sky_star_density", type=float, default=0.00065)
+    parser.add_argument("--sky_star_luma_threshold", type=int, default=145)
+    parser.add_argument("--sky_luma_cap", type=float, default=0.42)
+    parser.add_argument("--sky_hotspot_ratio", type=float, default=1.55)
+    parser.add_argument(
+        "--sky_vae_tiling",
+        action="store_true",
+        help="Enable memory-saving tiled VAE decoding; disabled by default to avoid texture bands",
+    )
     parser.add_argument("--sky_device", default="mps", choices=["mps", "cuda", "cpu"])
     parser.add_argument("--sky_no_cpu_offload", action="store_true")
     parser.add_argument(
         "--build_night_mood",
         action="store_true",
-        help="Relight non-sky regions and build a switchable night Gaussian PLY",
+        help="Backward-compatible shortcut for --mood_presets night",
+    )
+    parser.add_argument(
+        "--mood_presets",
+        default="",
+        help=(
+            "Comma-separated circumplex mood presets to build: "
+            "neutral, serene, joyful, tense, melancholic, night"
+        ),
+    )
+    parser.add_argument("--mood_name", default="custom")
+    parser.add_argument("--mood_valence", type=float, default=None)
+    parser.add_argument("--mood_arousal", type=float, default=None)
+    parser.add_argument(
+        "--mood_time_of_day",
+        default="day",
+        choices=["day", "night"],
     )
     parser.add_argument("--night_exposure_ev", type=float, default=-2.65)
     parser.add_argument("--night_contrast", type=float, default=0.98)
@@ -371,14 +464,33 @@ def main() -> None:
     parser.add_argument("--night_shadow_suppression", type=float, default=0.82)
     parser.add_argument("--night_shadow_blur_fraction", type=float, default=0.035)
     parser.add_argument(
+        "--mood_refine_iters",
         "--night_mood_refine_iters",
+        dest="mood_refine_iters",
         type=int,
         default=0,
-        help="Appearance-only night refinement iterations; 0 uses analytic SH fitting only",
+        help="Appearance-only mood refinement iterations; 0 uses analytic SH fitting only",
     )
-    parser.add_argument("--night_training_image_size", type=int, default=384)
-    parser.add_argument("--night_n_views", type=int, default=8)
-    parser.add_argument("--night_phi_bands", default="67.5,45,0,-45,-67.5")
+    parser.add_argument(
+        "--mood_training_image_size",
+        "--night_training_image_size",
+        dest="mood_training_image_size",
+        type=int,
+        default=384,
+    )
+    parser.add_argument(
+        "--mood_n_views",
+        "--night_n_views",
+        dest="mood_n_views",
+        type=int,
+        default=8,
+    )
+    parser.add_argument(
+        "--mood_phi_bands",
+        "--night_phi_bands",
+        dest="mood_phi_bands",
+        default="67.5,45,0,-45,-67.5",
+    )
     parser.add_argument("--sam_variant", default="sam2", choices=["original", "mobile", "sam2"])
     parser.add_argument("--sam2_checkpoint", default="checkpoints/SAM 2.1 Hiera Large.pt")
     
@@ -387,6 +499,29 @@ def main() -> None:
     parser.add_argument("--equirect_kernel_size", type=int, default=7)
 
     args = parser.parse_args()
+    _seed_everything(args.seed)
+
+    mood_names = [
+        value.strip().lower()
+        for value in args.mood_presets.split(",")
+        if value.strip()
+    ]
+    if args.build_night_mood and "night" not in mood_names:
+        mood_names.append("night")
+    custom_mood_requested = (
+        args.mood_valence is not None or args.mood_arousal is not None
+    )
+    if custom_mood_requested:
+        if args.mood_valence is None or args.mood_arousal is None:
+            raise ValueError(
+                "--mood_valence and --mood_arousal must be provided together"
+            )
+        custom_name = args.mood_name.strip().lower().replace(" ", "_")
+        mood_names = [name for name in mood_names if name != custom_name]
+        mood_names.append(custom_name)
+    else:
+        custom_name = None
+    mood_names = list(dict.fromkeys(mood_names))
 
     save_root = args.save_dir if args.save_dir else args.input_dir
     save_scene = os.path.join(save_root, "scene")
@@ -446,6 +581,7 @@ def main() -> None:
         if args.force_resegment and has_existing_layers:
             print(f"[pipeline] Clearing existing layer outputs at {traindata_dir} before resegmenting.")
             _clear_existing_layer_outputs(Path(save_root))
+        layer_data_started = time.perf_counter()
         metadata_path = Path(
             generate_layer_data(
                 input_dir=args.input_dir,
@@ -490,10 +626,16 @@ def main() -> None:
                 sky_sphere_radius=args.sky_sphere_radius,
                 sky_radius_percentile=args.sky_radius_percentile,
                 sky_radius_scale=args.sky_radius_scale,
+                benchmark_eval_fraction=args.benchmark_eval_fraction,
+                benchmark_split_seed=args.benchmark_split_seed,
                 use_full_scene_background=args.use_full_scene_background,
                 equirect_min_votes=args.equirect_min_votes,
                 equirect_kernel_size=args.equirect_kernel_size,
             )
+        )
+        record_stage(
+            "generation_of_layer_training_data",
+            time.perf_counter() - layer_data_started,
         )
 
     if not args.skip_preflight:
@@ -505,75 +647,104 @@ def main() -> None:
             require_sky=bool(
                 args.require_sky_layer
                 or args.retexture_night_sky
-                or args.build_night_mood
+                or bool(mood_names)
             ),
             min_sky_coverage=args.sky_min_coverage,
         )
+
+    if args.segment_only:
+        print("[pipeline] segment_only enabled; skipping relighting, training, and merge.")
+        return
 
     if args.retexture_night_sky:
         from utils.sky_retexture import DEFAULT_NIGHT_PROMPT, SkyRetextureConfig, retexture_sky
 
         print("[pipeline] Generating masked night-sky ERP")
-        retexture_sky(
-            scene_root=save_root,
-            metadata_path=metadata_path,
-            config=SkyRetextureConfig(
-                model_path=args.sky_model_path,
-                prompt=args.sky_prompt or DEFAULT_NIGHT_PROMPT,
-                seed=args.sky_seed,
-                num_inference_steps=args.sky_steps,
-                guidance_scale=args.sky_guidance_scale,
-                max_pixels=args.sky_max_pixels,
-                mask_dilate_px=args.sky_mask_dilate_px,
-                mask_feather_px=args.sky_mask_feather_px,
-                circular_padding_ratio=args.sky_circular_padding_ratio,
-                min_sky_coverage=args.sky_min_coverage,
-                device=args.sky_device,
-                cpu_offload=not args.sky_no_cpu_offload,
-            ),
+        with pipeline_stage("night_sky_generation"):
+            retexture_sky(
+                scene_root=save_root,
+                metadata_path=metadata_path,
+                config=SkyRetextureConfig(
+                    model_path=args.sky_model_path,
+                    prompt=args.sky_prompt or DEFAULT_NIGHT_PROMPT,
+                    seed=args.sky_seed,
+                    num_inference_steps=args.sky_steps,
+                    guidance_scale=args.sky_guidance_scale,
+                    max_pixels=args.sky_max_pixels,
+                    mask_dilate_px=args.sky_mask_dilate_px,
+                    mask_feather_px=args.sky_mask_feather_px,
+                    circular_padding_ratio=args.sky_circular_padding_ratio,
+                    min_sky_coverage=args.sky_min_coverage,
+                    star_density=args.sky_star_density,
+                    star_luma_threshold=args.sky_star_luma_threshold,
+                    sky_luma_cap=args.sky_luma_cap,
+                    sky_hotspot_ratio=args.sky_hotspot_ratio,
+                    vae_tiling=args.sky_vae_tiling,
+                    device=args.sky_device,
+                    cpu_offload=not args.sky_no_cpu_offload,
+                ),
+            )
+
+    mood_jobs = []
+    if mood_names:
+        from utils.mood_adaptation import (
+            NightMoodConfig,
+            build_mood_scene_erp,
+            get_mood_preset,
+            mood_from_circumplex,
         )
 
-    night_mood_config = None
-    night_scene_erp = None
-    if args.build_night_mood:
-        from utils.mood_adaptation import NightMoodConfig, build_night_scene_erp
-
-        night_mood_config = NightMoodConfig(
-            exposure_ev=args.night_exposure_ev,
-            contrast=args.night_contrast,
-            saturation=args.night_saturation,
-            shadow_suppression=args.night_shadow_suppression,
-            shadow_blur_fraction=args.night_shadow_blur_fraction,
-        )
-        print("[pipeline] Relighting the non-sky scene for the night mood")
-        night_scene_erp = build_night_scene_erp(
-            scene_root=save_root,
-            metadata_path=metadata_path,
-            config=night_mood_config,
-        )
+        for mood_name in mood_names:
+            if custom_mood_requested and mood_name == custom_name:
+                mood_config = mood_from_circumplex(
+                    name=mood_name,
+                    valence=args.mood_valence,
+                    arousal=args.mood_arousal,
+                    time_of_day=args.mood_time_of_day,
+                )
+            elif mood_name == "night":
+                mood_config = NightMoodConfig(
+                    exposure_ev=args.night_exposure_ev,
+                    contrast=args.night_contrast,
+                    saturation=args.night_saturation,
+                    shadow_suppression=args.night_shadow_suppression,
+                    shadow_blur_fraction=args.night_shadow_blur_fraction,
+                )
+            else:
+                mood_config = get_mood_preset(mood_name)
+            print(
+                f"[pipeline] Building {mood_name} ERP "
+                f"(valence={mood_config.valence:+.2f}, "
+                f"arousal={mood_config.arousal:+.2f})"
+            )
+            with pipeline_stage("non_sky_relighting"):
+                mood_scene_erp = build_mood_scene_erp(
+                    scene_root=save_root,
+                    metadata_path=metadata_path,
+                    config=mood_config,
+                )
+            mood_jobs.append((mood_name, mood_config, Path(mood_scene_erp)))
 
     if args.mood_only:
-        if not args.build_night_mood:
-            raise ValueError("--mood_only requires --build_night_mood")
+        if not mood_jobs:
+            raise ValueError("--mood_only requires --mood_presets or --build_night_mood")
         refined_candidate = Path(os.path.splitext(merged_out)[0] + "_refined.ply")
         day_candidate = refined_candidate if refined_candidate.exists() else Path(merged_out)
         if not day_candidate.exists():
             raise FileNotFoundError(
                 f"No existing day PLY for mood-only mode: {day_candidate}"
             )
-        _build_night_gaussian_mood(
-            args=args,
-            save_root=save_root,
-            save_scene=save_scene,
-            metadata_path=Path(metadata_path),
-            day_ply=day_candidate,
-            night_scene_erp=Path(night_scene_erp),
-            night_mood_config=night_mood_config,
-        )
-        return
-
-    if args.segment_only:
-        print("[pipeline] segment_only enabled; skipping layer training and merge.")
+        for mood_name, mood_config, mood_scene_erp in mood_jobs:
+            _build_gaussian_mood(
+                args=args,
+                save_root=save_root,
+                save_scene=save_scene,
+                metadata_path=Path(metadata_path),
+                day_ply=day_candidate,
+                mood_name=mood_name,
+                mood_scene_erp=mood_scene_erp,
+                mood_config=mood_config,
+            )
         return
 
     layerpano = LayerPano(
@@ -599,24 +770,26 @@ def main() -> None:
         mode="layer_instances",
     )
 
-    ply_paths = layerpano.create_layer_instances(
-        args.input_dir,
-        outlier_thresh=args.outlier_thresh,
-        metadata_path=str(metadata_path),
-        background_last=True,
-    )
+    with pipeline_stage("all_layer_training"):
+        ply_paths = layerpano.create_layer_instances(
+            args.input_dir,
+            outlier_thresh=args.outlier_thresh,
+            metadata_path=str(metadata_path),
+            background_last=True,
+        )
 
     if not ply_paths:
         raise RuntimeError("No layer PLYs produced")
 
     merge_started = time.perf_counter()
-    merge_ply_layers(
-        ply_paths,
-        merged_out,
-        voxel_size=args.merge_voxel_size,
-        min_opacity=args.merge_min_opacity,
-        max_points=merge_max_points,
-    )
+    with pipeline_stage("layer_merge"):
+        merge_ply_layers(
+            ply_paths,
+            merged_out,
+            voxel_size=args.merge_voxel_size,
+            min_opacity=args.merge_min_opacity,
+            max_points=merge_max_points,
+        )
     print(f"[timing] merge elapsed={time.perf_counter() - merge_started:.1f}s")
 
     if args.global_refine_iters and args.global_refine_iters > 0:
@@ -650,33 +823,33 @@ def main() -> None:
         }
         print(f"[pipeline] Global refine using {len(refine_frames)} full-scene frames.")
         refined_out = os.path.splitext(merged_out)[0] + "_refined.ply"
-        global_refine_after_merge(
-            traindata=traindata,
-            merged_ply_path=merged_out,
-            out_ply_path=refined_out,
-            num_iterations=args.global_refine_iters,
-            rasterizer=args.mps_rasterizer,
-            device=args.device,
-            adaptive=False,
-            max_points=merge_max_points,
-            downsample_ratio=args.downsample_ratio,
-            repulsion_weight=args.repulsion_weight,
-        )
+        with pipeline_stage("optional_global_refinement", iterations=args.global_refine_iters):
+            global_refine_after_merge(
+                traindata=traindata,
+                merged_ply_path=merged_out,
+                out_ply_path=refined_out,
+                num_iterations=args.global_refine_iters,
+                rasterizer=args.mps_rasterizer,
+                device=args.device,
+                adaptive=False,
+                max_points=merge_max_points,
+                downsample_ratio=args.downsample_ratio,
+                repulsion_weight=args.repulsion_weight,
+            )
         day_ply = Path(refined_out)
     else:
         day_ply = Path(merged_out)
 
-    if args.build_night_mood:
-        if night_mood_config is None or night_scene_erp is None:
-            raise RuntimeError("Night mood ERP was not initialized")
-        _build_night_gaussian_mood(
+    for mood_name, mood_config, mood_scene_erp in mood_jobs:
+        _build_gaussian_mood(
             args=args,
             save_root=save_root,
             save_scene=save_scene,
             metadata_path=Path(metadata_path),
             day_ply=day_ply,
-            night_scene_erp=Path(night_scene_erp),
-            night_mood_config=night_mood_config,
+            mood_name=mood_name,
+            mood_scene_erp=mood_scene_erp,
+            mood_config=mood_config,
         )
 
 

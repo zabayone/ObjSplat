@@ -1,0 +1,46 @@
+experiment_name: thesis_multi_scene
+output_root: benchmark_results
+scenes:
+  - name: scene_01
+    scene_root: benchmark_work/scene_01
+    input_panorama: path/to/scene_01.png
+  - name: scene_02
+    scene_root: benchmark_work/scene_02
+    input_panorama: path/to/scene_02.png
+rerun_segmentation: true
+retrain: true
+reuse_existing_outputs: false
+run_monolithic_baseline: false
+run_quality_evaluation: true
+run_rendering_benchmark: true
+run_edit_locality: true
+run_mood_evaluation: true
+fail_fast: false
+random_seed: 42
+resource_sampling_interval: 1.0
+splits:
+  training_fraction: 0.8
+  evaluation_fraction: 0.2
+rendering:
+  width: 512
+  height: 512
+  warmup_frames: 10
+  measured_frames: 100
+  rasterizer: cpp
+pipeline_args:
+  - --use_grounding_dino
+  - --aggregate_by_label
+  - --require_sky_layer
+  - --quality
+  - standard
+# Each enabled ablation is a separate, fully recorded run. For retraining,
+# give each ablation its own scene_root override to avoid reusing artifacts.
+ablations: []
+# Example:
+# ablations:
+#   - name: no_adaptive_topology
+#     scene_root: benchmark_work/scene_01_no_adaptive
+#     pipeline_args: []
+#   - name: adaptive_topology
+#     scene_root: benchmark_work/scene_01_adaptive
+#     pipeline_args: [--adaptive_topology]

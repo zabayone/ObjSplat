@@ -4,6 +4,20 @@ ObjSplat is a thesis project for object-aware 3D Gaussian Splatting from a singl
 
 The active workflow targets macOS / Apple Silicon and uses the MLX Splat-Apple backend.
 
+> **Research status.** ObjSplat is a master's thesis prototype. It prioritizes
+> reproducible experimentation and inspectable object-aware outputs; it is not a
+> production reconstruction service.
+
+## Features
+
+- Single-ERP reconstruction with an Apple Silicon–native MLX training backend.
+- GroundingDINO + SAM/SAM2 semantic-instance decomposition.
+- Independent object, background, residual, and far-sphere sky layers.
+- Integer instance labels retained in Gaussian PLY files when supported.
+- Layer removal, instance filtering, conservative global refinement, and mood variants.
+- Reproducible multi-scene benchmarking with resource traces, quantitative
+  metrics, plots, failure recovery, and Markdown reports.
+
 ## Pipeline
 
 1. Put the input panorama at `outputs_park/rgb.png` or set `OUT_DIR` to another output folder containing `rgb.png`.
@@ -16,6 +30,15 @@ The active workflow targets macOS / Apple Silicon and uses the MLX Splat-Apple b
 8. Merge layer PLY files and optionally run a conservative opacity-only refinement pass.
 
 ## Quick Start
+
+Clone the repository with its submodules, prepare the Apple Silicon environment,
+and consult [checkpoints/README.md](checkpoints/README.md) for model placement:
+
+```bash
+git clone --recurse-submodules https://github.com/zabayone/ObjSplat.git
+cd ObjSplat
+./setup_arm64.sh
+```
 
 Prepare the environment and checkpoints, then place your panorama at:
 
@@ -38,6 +61,7 @@ CLEAN_OUTPUT=0 FORCE_RESEGMENT=0 ./run_from_pano.sh
 RETEXTURE_NIGHT_SKY=1 ./run_from_pano.sh
 OUT_DIR=outputs_park CLEAN_OUTPUT=0 FORCE_RESEGMENT=1 SEGMENT_ONLY=1 RETEXTURE_NIGHT_SKY=1 ./run_from_pano.sh
 OUT_DIR=outputs_park CLEAN_OUTPUT=0 MOOD_ONLY=1 BUILD_NIGHT_MOOD=1 ./run_from_pano.sh
+OUT_DIR=outputs_park CLEAN_OUTPUT=0 MOOD_ONLY=1 MOOD_PRESETS="serene,joyful,tense,melancholic" ./run_from_pano.sh
 ```
 
 Generate the night-sky ERP after segmentation:
@@ -78,6 +102,40 @@ The active symlink is `scene/gsplat_scene_active.ply`. Use `--mood day` to
 switch back. If a day scene and night ERP already exist, `MOOD_ONLY=1` builds
 the night PLY without rerunning segmentation or day training.
 
+### Circumplex Moods
+
+Mood variants use the circumplex coordinates `valence` and `arousal`, both in
+`[-1, 1]`. Time of day remains independent, so the same emotional coordinates
+can produce a day or night variant. Built-in anchors are:
+
+| Preset | Valence | Arousal | Appearance |
+| --- | ---: | ---: | --- |
+| `serene` | `+0.72` | `-0.68` | Soft contrast, warm-neutral light, lifted shadows. |
+| `joyful` | `+0.82` | `+0.74` | Brighter, warmer, more saturated appearance. |
+| `tense` | `-0.76` | `+0.82` | Cold tint, stronger contrast, directional lighting. |
+| `melancholic` | `-0.72` | `-0.62` | Dim, blue, desaturated and softly directional. |
+| `night` | `-0.15` | `-0.35` | Generated night sky and full-scene night relighting. |
+
+Generate several preset PLY variants from an existing trained day scene:
+
+```bash
+OUT_DIR=outputs_park CLEAN_OUTPUT=0 MOOD_ONLY=1 \
+  MOOD_PRESETS="serene,joyful,tense,melancholic" ./run_from_pano.sh
+```
+
+Generate an arbitrary point in the continuous circumplex:
+
+```bash
+/opt/anaconda3/envs/layerpano3d/bin/python run_objsplat_pipeline.py \
+  --input_dir outputs_park --save_dir outputs_park --mood_only \
+  --mood_name focused --mood_valence 0.25 --mood_arousal 0.70
+```
+
+Add `--mood_time_of_day night` to apply the emotional offset to the night base;
+this requires an existing generated `traindata/sky/night_composite.png`.
+Every mood reuses the day Gaussian topology. Only the ERP appearance and SH
+coefficients change, and `scene/moods.json` stores its circumplex coordinates.
+
 Run the inexpensive layer-data preflight independently:
 
 ```bash
@@ -89,8 +147,10 @@ Run the inexpensive layer-data preflight independently:
 The default shell workflow uses a hybrid sky segmenter: lightweight
 `nvidia/segformer-b2-finetuned-ade-512-512` provides the semantic sky region,
 while high-resolution SAM masks protect trees, poles, roofs, and other thin
-foreground silhouettes. GroundingDINO + SAM2 remain responsible for the
-object-aware layers.
+foreground silhouettes. The sky pass also fills conservative zenith holes so
+the top-center panorama does not collapse to black, and the night retexturing
+path adds a sparse procedural star field if FLUX smooths stars away.
+GroundingDINO + SAM2 remain responsible for the object-aware layers.
 
 ## Main Outputs
 
@@ -101,9 +161,39 @@ object-aware layers.
 - `scene/gsplat_layerK.ply`: trained layer splats.
 - `scene/gsplat_scene_merged.ply`: merged scene.
 - `scene/gsplat_scene_merged_refined.ply`: optional conservative refinement.
-- `traindata/moods/night/scene_rgb.png`: night ERP including non-sky relighting.
-- `scene/gsplat_scene_night.ply`: night appearance with day geometry preserved.
+- `traindata/moods/<mood>/scene_rgb.png`: complete relit ERP for each mood.
+- `scene/gsplat_scene_<mood>.ply`: mood appearance with day geometry preserved.
 - `scene/moods.json` and `scene/gsplat_scene_active.ply`: mood manifest and active variant.
+
+## Reproducible Benchmarking
+
+The benchmark can analyse completed outputs or retrain from original ERP images
+with deterministic held-out perspective views. It records system/software
+metadata, stage timings, resource samples, layer and segmentation statistics,
+reconstruction fidelity, rendering speed, edit locality, mood topology, robust
+failure information, aggregate statistics, and thesis-ready plots.
+
+Analyse an existing scene without retraining:
+
+```bash
+/opt/anaconda3/envs/layerpano3d/bin/python benchmark/analyse_existing_scene.py \
+  --scene_root outputs_lgs
+```
+
+Run the prepared six-scene indoor/outdoor evaluation suite:
+
+```bash
+bash benchmark/run_evaluation_suite.sh
+```
+
+The suite expects local 2:1 ERP files under `benchmark/evaluation/`; these large
+inputs are intentionally ignored by Git. See
+[benchmark/evaluation/README.md](benchmark/evaluation/README.md) for naming and
+[benchmark/README.md](benchmark/README.md) for protocol details.
+
+Metric definitions and interpretation are available in
+[docs/ObjSplat_Benchmark_Metrics.docx](docs/ObjSplat_Benchmark_Metrics.docx)
+and [benchmark/METHODOLOGY.md](benchmark/METHODOLOGY.md).
 
 ## Important Files
 
@@ -114,17 +204,49 @@ object-aware layers.
 - `mps_splat_backend.py`: MLX 3DGS training, adaptive topology, merge, and refinement logic.
 - `utils/semantic_instance_detection.py`: GroundingDINO + SAM/SAM2 detection and mask cleanup.
 - `utils/open_ply_in_supersplat.py`: helper to inspect PLY outputs in SuperSplat.
+- `benchmark/run_benchmark.py`: multi-scene benchmark orchestrator.
+- `benchmark/schemas.py`: stable machine-readable CSV schemas.
+- `benchmark/configs/`: smoke, complete, thesis, and ablation configurations.
+- `benchmark/run_evaluation_suite.sh`: six-scene evaluation entry point.
+
+## Repository Structure
+
+```text
+ObjSplat/
+├── benchmark/              Reproducible evaluation framework and configurations
+├── gaussian_renderer/      Legacy Gaussian rendering integration
+├── rendering/              Video and trajectory render utilities
+├── scene/                  Gaussian scene/model abstractions
+├── src/                    Upstream research components
+├── submodules/             External backends, including Splat-Apple
+├── tests/                  Lightweight pipeline regression tests
+├── utils/                  Detection, depth, mood, sky, and viewer utilities
+├── generate_layer_data.py  ERP-to-layer training-data generation
+├── run_objsplat_pipeline.py
+└── run_from_pano.sh        Default end-to-end shell entry point
+```
 
 For large local PLY files, open the scene through:
 
 ```bash
-python utils/open_ply_in_supersplat.py outputs_lgs/scene/gsplat_scene_merged.ply
+python utils/open_ply_in_supersplat.py outputs_lgs
 ```
 
 The helper serves real HTTP byte ranges (`206 Partial Content`) and streams
 them in bounded chunks. This avoids SuperSplat's whole-file memory fallback,
 which can exhaust the browser buffer on scenes containing millions of
-Gaussians.
+Gaussians. When the scene contains `scene/moods.json`, the local viewer also
+shows an ObjSplat mood panel:
+
+- drag the valence-arousal pad for immediate whole-scene GPU modulation;
+- use the keyboard-accessible sliders for precise coordinates;
+- filter exact variants by day/night;
+- click a preset to load its precomputed PLY while preserving the camera;
+- use **Load nearest exact mood** to snap a continuous point to the closest
+  generated variant.
+
+Passing a specific PLY remains supported. If that PLY is inside a mood-enabled
+`scene/` directory, the controls are discovered automatically.
 
 ## Useful Settings
 
@@ -133,14 +255,13 @@ Most defaults can be overridden through environment variables before running `ru
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `GROUNDING_PROMPTS` | default classes (listed above) | Semantic classes detected by GroundingDINO. |
-
 | `GROUNDING_BOX_THRESHOLD` | `0.18` | Lower values keep more detections. |
 | `GROUNDING_TEXT_THRESHOLD` | `0.15` | Lower values accept weaker text matches. |
 | `GROUNDING_MASK_MIN_AREA` | `500` | Minimum SAM mask area in pixels. |
 | `GROUNDING_INFER_MAX_SIDE` | `1536` | Max panorama side used for GroundingDINO inference. |
-| `GROUNDING_BOX_PADDING` | `0.00` | Box padding used to clip SAM masks. |
-| `GROUNDING_MORPH_OPEN_KERNEL` | `9` | Morphological cleanup kernel for thin mask artifacts. |
-| `GROUNDING_MIN_COMPONENT_AREA_RATIO` | `0.08` | Minimum detached component size kept after SAM cleanup. |
+| `GROUNDING_BOX_PADDING` | `0.12` | Box padding used to clip SAM masks. |
+| `GROUNDING_MORPH_OPEN_KERNEL` | `3` | Morphological cleanup kernel for thin mask artifacts. |
+| `GROUNDING_MIN_COMPONENT_AREA_RATIO` | `0.01` | Minimum detached component size kept after SAM cleanup. |
 | `MIN_POINTS_3D` | `1000` | Minimum projected 3D points required for a layer. |
 | `PERSPECTIVE_SIZE` | `1024` | Maximum side of generated perspective training views. |
 | `SKY_SEGMENTATION_BACKEND` | `hybrid` | Use SegFormer for sky and Grounding-SAM for object boundaries. |
@@ -159,6 +280,11 @@ Most defaults can be overridden through environment variables before running `ru
 | `MOOD_ONLY` | `0` | Reuse segmentation and day PLY, generating only mood outputs. |
 | `RETEXTURE_NIGHT_SKY` | `0` | Generate canonical night-sky ERP assets before 3DGS training. |
 | `BUILD_NIGHT_MOOD` | same as `RETEXTURE_NIGHT_SKY` | Relight the rest of the scene and build the night PLY. |
+| `MOOD_PRESETS` | empty | Comma-separated circumplex anchors to build. |
+| `SKY_VAE_TILING` | `0` | Enable memory-saving tiled VAE decoding; leave disabled to avoid bands in the generated sky texture. |
+| `SKY_STAR_DENSITY` | `0.00065` | Density of spherical, PSF-rendered procedural stars. |
+| `SKY_LUMA_CAP` | `0.42` | Maximum low-frequency night-sky luminance before hotspot compression. |
+| `SKY_HOTSPOT_RATIO` | `1.55` | Maximum broad luminance relative to the median sky. |
 | `NIGHT_MOOD_REFINE_ITERS` | `0` | Optional SH-only night refinement iterations. |
 | `NIGHT_TRAINING_IMAGE_SIZE` | `512` | Raster size used only by optional night refinement. |
 | `SKY_MODEL_PATH` | `checkpoints/FLUX.1-Fill-dev` | Local Diffusers checkpoint used for sky filling. |
@@ -194,3 +320,8 @@ estimates for an effectively infinite surface.
 ## Credits
 
 This project builds on concepts and code from LayerPano3D, LabelGS, GroundingDINO, SAM/SAM2, and Splat-Apple. Please cite the original projects when using their components or pretrained models.
+
+## License
+
+ObjSplat is distributed under the terms in [LICENSE](LICENSE). Third-party
+components and model checkpoints retain their respective licenses.

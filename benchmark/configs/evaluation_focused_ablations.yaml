@@ -1,0 +1,129 @@
+experiment_name: evaluation_focused_ablations
+output_root: benchmark_results
+python_executable: /opt/anaconda3/envs/layerpano3d/bin/python
+
+input_preprocessing:
+  target_width: 4096
+  require_equirectangular_2_to_1: true
+
+# One representative indoor and one outdoor scene. Each ablation gets its own
+# working directory. Segmentation/depth are immutable and shared from the main
+# six-scene run, while every training variant keeps independent PLY outputs.
+shared_preprocessing_root_template: benchmark_work/evaluation_main/{scene}
+scenes:
+  - name: indoor_1
+    scene_root: benchmark_work/evaluation_ablation_unused/indoor_1
+    input_panorama: benchmark/evaluation/indoor_1.jpg
+    pipeline_args:
+      - --grounding_prompts
+      - "wall . floor . ceiling . door . window . chair . table . sofa . cabinet . shelf . lamp . plant . person"
+      - --sky_segmentation_backend
+      - grounding_sam
+  - name: outdoor_1
+    scene_root: benchmark_work/evaluation_ablation_unused/outdoor_1
+    input_panorama: benchmark/evaluation/outdoor_1.jpg
+    pipeline_args:
+      - --grounding_prompts
+      - "sky . road . pavement . grass . tree . trees . bush . shrub . plant . vegetation . foliage . branches . building . fence . pole . person . car"
+      - --sky_segmentation_backend
+      - hybrid
+      - --require_sky_layer
+
+ablations:
+  - name: downsample_050
+    scene_root_template: benchmark_work/evaluation_ablations/{scene}/downsample_050
+    pipeline_args: [--downsample_ratio, "0.5"]
+  - name: downsample_025
+    scene_root_template: benchmark_work/evaluation_ablations/{scene}/downsample_025
+    pipeline_args: [--downsample_ratio, "0.25"]
+  - name: image_384
+    scene_root_template: benchmark_work/evaluation_ablations/{scene}/image_384
+    pipeline_args: [--training_image_size, "384"]
+  - name: image_1024
+    scene_root_template: benchmark_work/evaluation_ablations/{scene}/image_1024
+    pipeline_args: [--training_image_size, "1024"]
+  - name: iterations_low
+    scene_root_template: benchmark_work/evaluation_ablations/{scene}/iterations_low
+    pipeline_args:
+      [--layer_iterations, "400", --background_iterations, "500", --sky_iterations, "250"]
+  - name: iterations_high
+    scene_root_template: benchmark_work/evaluation_ablations/{scene}/iterations_high
+    pipeline_args:
+      [--layer_iterations, "1200", --background_iterations, "1500", --sky_iterations, "750"]
+  - name: adaptive_topology
+    scene_root_template: benchmark_work/evaluation_ablations/{scene}/adaptive_topology
+    pipeline_args: [--adaptive_topology]
+  - name: global_refine_200
+    scene_root_template: benchmark_work/evaluation_ablations/{scene}/global_refine_200
+    pipeline_args: [--global_refine_iters, "200"]
+
+rerun_segmentation: false
+retrain: true
+reuse_existing_outputs: true
+run_monolithic_baseline: false
+run_quality_evaluation: true
+run_rendering_benchmark: true
+run_edit_locality: true
+run_mood_evaluation: false
+fail_fast: false
+random_seed: 42
+resource_sampling_interval: 1.0
+
+splits:
+  training_fraction: 0.8
+  evaluation_fraction: 0.2
+
+rendering:
+  width: 512
+  height: 512
+  warmup_frames: 5
+  measured_frames: 30
+  rasterizer: cpp
+
+quality_evaluation:
+  max_side: 512
+
+selected_layers: [0]
+selected_instances: []
+
+pipeline_args:
+  - --device
+  - mps
+  - --depth_scale
+  - "200"
+  - --n_views
+  - "12"
+  - --phi_bands
+  - "80,67.5,45,0,-45,-67.5,-80"
+  - --perspective_size
+  - "1024"
+  - --use_grounding_dino
+  - --grounding_box_threshold
+  - "0.18"
+  - --grounding_text_threshold
+  - "0.15"
+  - --grounding_mask_min_area
+  - "500"
+  - --grounding_infer_max_side
+  - "1536"
+  - --aggregate_by_label
+  - --min_points_3d
+  - "1000"
+  - --quality
+  - standard
+  - --mps_rasterizer
+  - cpp
+  - --max_points
+  - "0"
+  - --downsample_ratio
+  - "1.0"
+  - --training_image_size
+  - "640"
+  - --layer_iterations
+  - "800"
+  - --background_iterations
+  - "1000"
+  - --sky_iterations
+  - "500"
+  - --global_refine_iters
+  - "0"

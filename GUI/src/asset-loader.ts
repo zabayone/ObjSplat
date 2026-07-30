@@ -62,7 +62,7 @@ class AssetLoader {
             if (estimatedBytes > MAX_ESTIMATED_GSPLAT_BYTES) {
                 throw new Error(
                     `Dataset too large for interactive viewer safety (${formatBytes(estimatedBytes)} estimated raw data). ` +
-                    `Please convert/compress or decimate before loading (for example: compressed PLY, reduced SH bands, or fewer splats).`
+                    'Please convert/compress or decimate before loading (for example: compressed PLY, reduced SH bands, or fewer splats).'
                 );
             }
 

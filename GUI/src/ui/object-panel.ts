@@ -265,7 +265,7 @@ class ObjectPanel extends Container {
         const moodSelect = new SelectInput({
             class: 'view-panel-row-select',
             defaultValue: neutralPreset.id,
-            options: moodPresets.map((preset) => ({ v: preset.id, t: preset.label }))
+            options: moodPresets.map(preset => ({ v: preset.id, t: preset.label }))
         });
 
         moodRow.append(moodLabel);
@@ -373,7 +373,7 @@ class ObjectPanel extends Container {
         let suppress = false;
 
         const activePreset = () => {
-            return moodPresets.find((preset) => preset.id === moodSelect.value) ?? neutralPreset;
+            return moodPresets.find(preset => preset.id === moodSelect.value) ?? neutralPreset;
         };
 
         const selectedObjectInfo = (splat: Splat) => {

@@ -76,6 +76,44 @@ def _protect_thin_dark_details(image: np.ndarray, sky_mask: np.ndarray) -> tuple
     return protected, int(details.sum())
 
 
+def _fill_zenith_cap(sky_mask: np.ndarray) -> tuple[np.ndarray, int]:
+    """Fill a small zenith cap when the surrounding upper sky is already present."""
+    mask = np.asarray(sky_mask, dtype=bool).copy()
+    h, w = mask.shape
+    if h <= 0 or w <= 0:
+        return mask, 0
+
+    cap_h = max(4, int(round(h * 0.16)))
+    cap_w = max(8, int(round(w * 0.22)))
+    yy, xx = np.ogrid[:cap_h, :w]
+    cx = (w - 1) * 0.5
+    ellipse = ((xx - cx) / max(1.0, cap_w * 0.5)) ** 2 + (yy / max(1.0, cap_h)) ** 2 <= 1.0
+
+    center_x1 = max(0, int(round(w * 0.36)))
+    center_x2 = min(w, int(round(w * 0.64)))
+    if center_x2 <= center_x1:
+        return mask, 0
+
+    upper_band = mask[:cap_h, :]
+    center_band = mask[:cap_h, center_x1:center_x2]
+    support_band = mask[: max(1, int(round(cap_h * 0.75))), :]
+
+    # Only fill if the top sky is already established around the hole. This
+    # keeps the heuristic conservative for scenes with genuine overhead cover.
+    support_coverage = float(support_band.mean()) if support_band.size else 0.0
+    center_coverage = float(center_band.mean()) if center_band.size else 0.0
+    if support_coverage < 0.05 or center_coverage >= 0.20:
+        return mask, 0
+
+    fill = ellipse & ~mask[:cap_h, :]
+    if not fill.any():
+        return mask, 0
+    top = mask[:cap_h, :].copy()
+    top[fill] = True
+    mask[:cap_h, :] = top
+    return mask, int(fill.sum())
+
+
 def segment_sky_segformer(
     pano_rgb: np.ndarray,
     model_id: str = "nvidia/segformer-b2-finetuned-ade-512-512",
@@ -130,6 +168,7 @@ def segment_sky_segformer(
         interpolation=cv2.INTER_NEAREST,
     ).astype(bool)
     full_mask, protected_dark_pixels = _protect_thin_dark_details(source, full_mask)
+    full_mask, zenith_cap_pixels = _fill_zenith_cap(full_mask)
     diagnostics = {
         "model": model_id,
         "work_size": [int(work.shape[1]), int(work.shape[0])],
@@ -139,6 +178,7 @@ def segment_sky_segformer(
         "coverage": float(full_mask.mean()),
         "mean_sky_probability": float(probability[clean_mask].mean()) if clean_mask.any() else 0.0,
         "protected_dark_detail_pixels": int(protected_dark_pixels),
+        "zenith_cap_pixels": int(zenith_cap_pixels),
     }
     del model
     if device == "mps" and hasattr(torch, "mps"):

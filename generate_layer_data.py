@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +31,7 @@ import utils.pano_utils.Equirec2Perspec as E2P
 from utils.trajectory import gcd_pose_gs
 from utils.semantic_instance_detection import detect_objects_grounding_then_sam_on_panorama
 from utils.sky_segmentation import segment_sky_segformer
+from benchmark.runtime_hooks import pipeline_stage, record_stage
 
 
 def _numeric_suffix_key(path: Path) -> tuple[int, str]:
@@ -995,11 +997,11 @@ def generate_layer_data(
     grounding_max_detections: Optional[int] = None,
     grounding_mask_min_area: int = 1500,
     grounding_sam_multimask: bool = True,
-    grounding_box_padding: float = 0.15,
+    grounding_box_padding: float = 0.12,
     grounding_infer_max_side: int = 1024,
     grounding_exclude_labels: Optional[str] = None,
-    grounding_min_component_area_ratio: float = 0.02,
-    grounding_morph_open_kernel: int = 5,
+    grounding_min_component_area_ratio: float = 0.01,
+    grounding_morph_open_kernel: int = 3,
     aggregate_by_label: bool = False,
     require_sky_layer: bool = False,
     fill_unassigned_layers: bool = False,
@@ -1010,12 +1012,15 @@ def generate_layer_data(
     sky_sphere_radius: float = 0.0,
     sky_radius_percentile: float = 95.0,
     sky_radius_scale: float = 1.25,
+    benchmark_eval_fraction: float = 0.0,
+    benchmark_split_seed: int = 42,
 ) -> Path:
     input_path = Path(input_dir)
     save_path = Path(save_dir) if save_dir else input_path
 
     pano_rgb = _load_rgb(input_path)
-    depth = _load_depth(input_path, depth_model, force=False)
+    with pipeline_stage("depth_estimation_or_loading"):
+        depth = _load_depth(input_path, depth_model, force=False)
     depth = np.asarray(depth, dtype=np.float32).squeeze()
     if depth.shape != pano_rgb.shape[:2]:
         raise ValueError(
@@ -1054,13 +1059,33 @@ def generate_layer_data(
         except Exception:
             auto_scaled = False
 
-    frames_path = _ensure_frames_dir(
-        input_path,
-        Path(frames_dir) if frames_dir else None,
-        n_views=n_views,
-        phi_bands=phi_bands,
-        perspective_size=perspective_size,
+    with pipeline_stage("perspective_view_generation"):
+        frames_path = _ensure_frames_dir(
+            input_path,
+            Path(frames_dir) if frames_dir else None,
+            n_views=n_views,
+            phi_bands=phi_bands,
+            perspective_size=perspective_size,
+        )
+    frame_indices = sorted(
+        int(path.stem.rsplit("_", 1)[1])
+        for path in frames_path.glob("rgb_*.png")
+        if path.stem.rsplit("_", 1)[-1].isdigit()
     )
+    evaluation_indices: set[int] = set()
+    eval_fraction = float(np.clip(benchmark_eval_fraction, 0.0, 0.9))
+    if eval_fraction > 0 and len(frame_indices) >= 2:
+        eval_count = max(1, int(round(len(frame_indices) * eval_fraction)))
+        eval_count = min(eval_count, len(frame_indices) - 1)
+        split_rng = np.random.default_rng(int(benchmark_split_seed))
+        evaluation_indices = set(
+            int(value)
+            for value in split_rng.choice(frame_indices, size=eval_count, replace=False)
+        )
+        print(
+            f"[BenchmarkSplit] held out {len(evaluation_indices)}/{len(frame_indices)} "
+            "perspective views from 3DGS training"
+        )
 
     # Optional final refine layer not created by default. Set to None unless explicit refine requested.
     final_refine_layer_idx = None
@@ -1074,24 +1099,25 @@ def generate_layer_data(
 
     print(f"[Grounding SAM] Running detection on {input_path / 'rgb.png'}")
     prompt_sam_checkpoint = sam2_checkpoint if str(sam_variant).lower() == "sam2" else sam_checkpoint
-    res = detect_objects_grounding_then_sam_on_panorama(
-        input_path / "rgb.png",
-        sam_checkpoint=prompt_sam_checkpoint,
-        device=device,
-        use_grounding=use_grounding_dino,
-        grounding_checkpoint=grounding_dino_checkpoint,
-        sam_variant=sam_variant,
-        grounding_prompts=grounding_prompts,
-        box_threshold=grounding_box_threshold,
-        text_threshold=grounding_text_threshold,
-        max_detections=grounding_max_detections,
-        multimask_output=grounding_sam_multimask,
-        min_mask_area=grounding_mask_min_area,
-        box_padding_ratio=grounding_box_padding,
-        grounding_infer_max_side=grounding_infer_max_side,
-        min_component_area_ratio=grounding_min_component_area_ratio,
-        morph_open_kernel=grounding_morph_open_kernel,
-    )
+    with pipeline_stage("object_detection_and_segmentation"):
+        res = detect_objects_grounding_then_sam_on_panorama(
+            input_path / "rgb.png",
+            sam_checkpoint=prompt_sam_checkpoint,
+            device=device,
+            use_grounding=use_grounding_dino,
+            grounding_checkpoint=grounding_dino_checkpoint,
+            sam_variant=sam_variant,
+            grounding_prompts=grounding_prompts,
+            box_threshold=grounding_box_threshold,
+            text_threshold=grounding_text_threshold,
+            max_detections=grounding_max_detections,
+            multimask_output=grounding_sam_multimask,
+            min_mask_area=grounding_mask_min_area,
+            box_padding_ratio=grounding_box_padding,
+            grounding_infer_max_side=grounding_infer_max_side,
+            min_component_area_ratio=grounding_min_component_area_ratio,
+            morph_open_kernel=grounding_morph_open_kernel,
+        )
     grounding_status = res.get("grounding_status", {})
     if use_grounding_dino and not grounding_status.get("succeeded", False):
         raise RuntimeError(
@@ -1336,6 +1362,7 @@ def generate_layer_data(
         )
 
     print("[Grounding SAM] Projecting instance ids to 3D")
+    projection_started = time.perf_counter()
     if grounding_erp_instance_map is not None:
         imap_eq = grounding_erp_instance_map.copy()
     else:
@@ -1367,6 +1394,11 @@ def generate_layer_data(
         stat.points_3d = points
         if points <= 0 or (points < min_points_3d and inst_id not in sky_instance_ids):
             raw_stats.pop(inst_id)
+    record_stage(
+        "projection_of_masks_into_3d",
+        time.perf_counter() - projection_started,
+        input_points=int(len(xyz)),
+    )
 
     if not raw_stats:
         raise RuntimeError("No instances passed the 3D point threshold")
@@ -1437,12 +1469,13 @@ def generate_layer_data(
         for inst_id in group["instance_ids"]:
             instance_to_layer[int(inst_id)] = int(layer_idx)
 
-    layer_map_2d, cleanup_stats = _consolidate_layer_label_map(
-        labels_2d,
-        layer_groups,
-        pano_rgb,
-        fill_unassigned=fill_unassigned_layers,
-    )
+    with pipeline_stage("mask_post_processing"):
+        layer_map_2d, cleanup_stats = _consolidate_layer_label_map(
+            labels_2d,
+            layer_groups,
+            pano_rgb,
+            fill_unassigned=fill_unassigned_layers,
+        )
     labels_2d = _labels_from_consolidated_layer_map(labels_2d, layer_map_2d, layer_groups)
     labels_3d = labels_2d.reshape(-1).astype(np.int32)
     for inst_id, stat in raw_stats.items():
@@ -1493,6 +1526,8 @@ def generate_layer_data(
 
         erp_mask = np.isin(labels_2d, group_ids)
         for frame_idx, fmap in frame_items:
+            if int(frame_idx) in evaluation_indices:
+                continue
             rgb_path = frames_path / f"rgb_{frame_idx}.png"
             pose_path = frames_path / f"transform_matrix_{frame_idx}.npy"
             if not rgb_path.exists() or not pose_path.exists():
@@ -1575,6 +1610,8 @@ def generate_layer_data(
             )
 
             for frame_idx, fmap in instance_maps.items():
+                if int(frame_idx) in evaluation_indices:
+                    continue
                 rgb_path = frames_path / f"rgb_{frame_idx}.png"
                 pose_path = frames_path / f"transform_matrix_{frame_idx}.npy"
                 if not rgb_path.exists() or not pose_path.exists():
@@ -1635,6 +1672,8 @@ def generate_layer_data(
         overlay_masks.append((residual_layer_idx, residual_erp_mask))
 
         for frame_idx, fmap in instance_maps.items():
+            if int(frame_idx) in evaluation_indices:
+                continue
             rgb_path = frames_path / f"rgb_{frame_idx}.png"
             pose_path = frames_path / f"transform_matrix_{frame_idx}.npy"
             if not rgb_path.exists() or not pose_path.exists():
@@ -1677,6 +1716,16 @@ def generate_layer_data(
             "phi_bands": [float(value) for value in (phi_bands or [])],
             "perspective_size": int(perspective_size) if perspective_size else None,
             "fov_degrees": 90.0,
+        },
+        "benchmark_view_split": {
+            "seed": int(benchmark_split_seed),
+            "evaluation_fraction": eval_fraction,
+            "training_indices": [
+                int(value) for value in frame_indices if value not in evaluation_indices
+            ],
+            "evaluation_indices": sorted(evaluation_indices),
+            "deterministic": True,
+            "evaluation_views_used_for_segmentation_but_not_3dgs_training": True,
         },
         "depth_scale": float(depth_scale),
         "invalid_depth_fraction": invalid_depth_fraction,
@@ -1780,6 +1829,8 @@ def main() -> None:
     parser.add_argument("--n_views", type=int, default=12)
     parser.add_argument("--phi_bands", default="80,67.5,45,0,-45,-67.5,-80", help="Comma-separated phi bands in degrees")
     parser.add_argument("--perspective_size", type=int, default=1024)
+    parser.add_argument("--benchmark_eval_fraction", type=float, default=0.0)
+    parser.add_argument("--benchmark_split_seed", type=int, default=42)
     parser.add_argument("--equirect_min_votes", type=int, default=1)
     parser.add_argument("--equirect_kernel_size", type=int, default=15)
     parser.add_argument("--use_grounding_dino", action="store_true", help="Enable GroundingDINO proposals + tagging")
@@ -1790,11 +1841,11 @@ def main() -> None:
     parser.add_argument("--grounding_max_detections", type=int, default=None)
     parser.add_argument("--grounding_mask_min_area", type=int, default=1500)
     parser.add_argument("--grounding_single_mask", action="store_true", help="Use SAM's best single mask per GroundingDINO box")
-    parser.add_argument("--grounding_box_padding", type=float, default=0.15, help="Padding ratio used to clip SAM masks around each GroundingDINO box")
+    parser.add_argument("--grounding_box_padding", type=float, default=0.12, help="Padding ratio used to clip SAM masks around each GroundingDINO box")
     parser.add_argument("--grounding_infer_max_side", type=int, default=1024, help="Max panorama side used for GroundingDINO inference")
     parser.add_argument("--grounding_exclude_labels", default=None, help="Optional comma-separated labels to exclude from object layers")
-    parser.add_argument("--grounding_min_component_area_ratio", type=float, default=0.02, help="Drop detached SAM mask components smaller than this fraction of total mask area")
-    parser.add_argument("--grounding_morph_open_kernel", type=int, default=5, help="Opening kernel used to remove thin detached mask artifacts; set 0 to disable")
+    parser.add_argument("--grounding_min_component_area_ratio", type=float, default=0.01, help="Drop detached SAM mask components smaller than this fraction of total mask area")
+    parser.add_argument("--grounding_morph_open_kernel", type=int, default=3, help="Opening kernel used to remove thin detached mask artifacts; set 0 to disable")
     parser.add_argument("--aggregate_by_label", action="store_true", help="Group same-label Grounding-SAM instances into shared training layers while preserving instance labels")
     parser.add_argument("--fill_unassigned_layers", action="store_true", help="Force uncovered ERP pixels into nearest detected layers")
     parser.add_argument("--require_sky_layer", action="store_true", help="Fail if no semantic sky layer can be isolated")
@@ -1830,6 +1881,8 @@ def main() -> None:
         n_views=args.n_views,
         phi_bands=phi_bands,
         perspective_size=args.perspective_size,
+        benchmark_eval_fraction=args.benchmark_eval_fraction,
+        benchmark_split_seed=args.benchmark_split_seed,
         use_full_scene_background=args.use_full_scene_background,
         equirect_min_votes=args.equirect_min_votes,
         equirect_kernel_size=args.equirect_kernel_size,

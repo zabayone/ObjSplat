@@ -1,0 +1,14 @@
+experiment_name: smoke_existing_outputs
+output_root: benchmark_results
+scenes:
+  - name: outputs_lgs
+    scene_root: outputs_lgs
+reuse_existing_outputs: true
+rerun_segmentation: false
+retrain: false
+run_quality_evaluation: false
+run_rendering_benchmark: false
+run_edit_locality: false
+run_mood_evaluation: true
+resource_sampling_interval: 1.0
+random_seed: 42

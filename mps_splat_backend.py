@@ -14,6 +14,7 @@ from plyfile import PlyData, PlyElement
 from tqdm import tqdm
 
 from utils.labelgs_mps import infer_point_labels, write_layerpano_compatible_ply
+from benchmark.runtime_hooks import record_stage
 
 
 # ---------------------------------------------------------------------------
@@ -30,6 +31,22 @@ def _pose_to_w2c(pose: np.ndarray) -> np.ndarray:
     w2c[1:3, :3] *= -1
     w2c[:3, 3] *= -1
     return w2c.astype(np.float32)
+
+
+def _balanced_camera_indices(
+    num_cameras: int,
+    num_iterations: int,
+    rng=random,
+) -> List[int]:
+    """Create shuffled epochs so every training view is sampled uniformly."""
+    if num_cameras <= 0:
+        raise ValueError("num_cameras must be positive")
+    indices: List[int] = []
+    while len(indices) < max(0, int(num_iterations)):
+        epoch = list(range(int(num_cameras)))
+        rng.shuffle(epoch)
+        indices.extend(epoch)
+    return indices[: max(0, int(num_iterations))]
 
 
 def _estimate_log_scales(
@@ -593,7 +610,7 @@ def _build_training_batch_mlx(traindata: Dict, downsample_ratio: float = 1.0):
     width   = int(traindata["W"])
     height  = int(traindata["H"])
     fovx = math.radians(fov_deg)
-    fovy = height * fovx / width
+    fovy = 2.0 * math.atan((height / width) * math.tan(fovx / 2.0))
     fx   = width  / (2.0 * math.tan(fovx / 2.0))
     fy   = height / (2.0 * math.tan(fovy / 2.0))
     cx   = width  / 2.0
@@ -927,15 +944,26 @@ def _train_mlx(
     else:
         frozen_mask = np.asarray(frozen_mask, dtype=bool).reshape(-1)
 
-    progress = tqdm(range(num_iterations), desc="Splat-Apple MLX training")
+    progress = tqdm(
+        range(num_iterations),
+        desc="Splat-Apple MLX training",
+        mininterval=0.5,
+    )
     t0 = time.time()
 
     best_loss = float("inf")
     no_improve = 0
     no_improve_lr = 0
+    monitor_loss = bool(
+        (early_stop_patience is not None and early_stop_patience > 0)
+        or (lr_plateau_patience is not None and lr_plateau_patience > 0)
+    )
+    camera_schedule = _balanced_camera_indices(
+        len(cameras), num_iterations, rng=random
+    )
 
     for i in progress:
-        cam_idx = random.randint(0, len(cameras) - 1)
+        cam_idx = camera_schedule[i]
         progress_fraction = float(i) / float(max(1, num_iterations))
         if progress_fraction < 0.15:
             active_sh_degree = 0
@@ -961,17 +989,25 @@ def _train_mlx(
             active_sh_degree=active_sh_degree,
         )
 
-        if i % 20 == 0 or i % 100 == 0:
-            mx.eval(loss, psnr)
-
-        loss_value = float(loss)
-        if loss_value < best_loss - float(early_stop_min_delta or 0.0):
-            best_loss = loss_value
-            no_improve = 0
-            no_improve_lr = 0
+        report_metrics = i % 20 == 0
+        optimizer_states = [optimizer.state for optimizer in optimizers.values()]
+        if monitor_loss or report_metrics:
+            mx.eval(params, optimizer_states, loss, psnr)
         else:
-            no_improve += 1
-            no_improve_lr += 1
+            # Materialize parameters and Adam state every step without forcing
+            # the diagnostic PSNR reduction or a Python scalar conversion.
+            mx.eval(params, optimizer_states)
+
+        loss_value = float(loss) if monitor_loss or report_metrics else None
+        psnr_value = float(psnr) if report_metrics else None
+        if monitor_loss:
+            if loss_value < best_loss - float(early_stop_min_delta or 0.0):
+                best_loss = loss_value
+                no_improve = 0
+                no_improve_lr = 0
+            else:
+                no_improve += 1
+                no_improve_lr += 1
 
         if lr_plateau_patience is not None and lr_plateau_patience > 0:
             if no_improve_lr >= lr_plateau_patience:
@@ -988,10 +1024,16 @@ def _train_mlx(
                 break
 
         if i % 20 == 0:
-            progress.set_postfix({"loss": f"{float(loss):.4f}", "psnr": f"{float(psnr):.2f}"})
+            progress.set_postfix(
+                {"loss": f"{loss_value:.4f}", "psnr": f"{psnr_value:.2f}"}
+            )
 
         if i % 100 == 0:
-            print(f"[splat-apple-mlx] iter={i} loss={float(loss):.5f} psnr={float(psnr):.2f} elapsed={time.time()-t0:.1f}s", flush=True)
+            print(
+                f"[splat-apple-mlx] iter={i} loss={loss_value:.5f} "
+                f"psnr={psnr_value:.2f} elapsed={time.time()-t0:.1f}s",
+                flush=True,
+            )
 
         if i > 0 and i % 3000 == 0:
             reset_val = float(_logit(opacity_init))
@@ -1054,6 +1096,15 @@ def _train_mlx(
         scale_log_min=scale_log_min,
         scale_log_max=scale_log_max,
         sh_degree=3,
+    )
+    completed_iterations = int(i + 1) if num_iterations > 0 else 0
+    record_stage(
+        "mlx_training_loop",
+        time.time() - t0,
+        iterations=completed_iterations,
+        frames=len(cameras),
+        input_points=int(len(xyz)),
+        output_gaussians=int(len(final_params["means"])),
     )
     return out_ply_path
 

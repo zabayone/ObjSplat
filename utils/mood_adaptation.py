@@ -1,4 +1,4 @@
-"""Build efficient day/night ERP and Gaussian parameter variants."""
+"""Build circumplex mood ERP and Gaussian appearance variants."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -20,7 +20,43 @@ SH_C0 = 0.28209479177387814
 
 
 @dataclass
-class NightMoodConfig:
+class MoodConfig:
+    name: str = "neutral"
+    valence: float = 0.0
+    arousal: float = 0.0
+    time_of_day: str = "day"
+    sky_source: str = "day"
+    exposure_ev: float = 0.0
+    contrast: float = 1.0
+    saturation: float = 1.0
+    blue_tint_r: float = 1.0
+    blue_tint_g: float = 1.0
+    blue_tint_b: float = 1.0
+    ambient_floor: float = 0.0
+    ambient_tint_r: float = 0.28
+    ambient_tint_g: float = 0.46
+    ambient_tint_b: float = 1.0
+    highlight_preservation: float = 0.0
+    shadow_suppression: float = 0.0
+    illumination_flattening: float = 0.0
+    shadow_blur_fraction: float = 0.035
+    shadow_threshold: float = 0.82
+    shadow_max_lift: float = 2.4
+    gaussian_color_strength: float = 1.0
+    gaussian_sky_strength: float = 1.0
+    directional_sh_scale: float = 0.55
+    sky_directional_sh_scale: float = 0.20
+    chunk_rows: int = 256
+    gaussian_chunk_size: int = 1_000_000
+
+
+@dataclass
+class NightMoodConfig(MoodConfig):
+    name: str = "night"
+    valence: float = -0.15
+    arousal: float = -0.35
+    time_of_day: str = "night"
+    sky_source: str = "night"
     exposure_ev: float = -2.65
     contrast: float = 0.98
     saturation: float = 0.32
@@ -31,15 +67,186 @@ class NightMoodConfig:
     highlight_preservation: float = 0.08
     shadow_suppression: float = 0.82
     illumination_flattening: float = 0.55
-    shadow_blur_fraction: float = 0.035
-    shadow_threshold: float = 0.82
-    shadow_max_lift: float = 2.4
-    gaussian_color_strength: float = 1.0
-    gaussian_sky_strength: float = 1.0
     directional_sh_scale: float = 0.55
     sky_directional_sh_scale: float = 0.20
-    chunk_rows: int = 256
-    gaussian_chunk_size: int = 1_000_000
+
+
+MOOD_PRESETS: dict[str, MoodConfig] = {
+    "neutral": MoodConfig(),
+    "serene": MoodConfig(
+        name="serene",
+        valence=0.72,
+        arousal=-0.68,
+        exposure_ev=-0.10,
+        contrast=0.88,
+        saturation=0.84,
+        blue_tint_r=1.03,
+        blue_tint_g=1.02,
+        blue_tint_b=0.96,
+        ambient_floor=0.006,
+        ambient_tint_r=0.92,
+        ambient_tint_g=0.96,
+        ambient_tint_b=1.0,
+        highlight_preservation=0.12,
+        shadow_suppression=0.48,
+        illumination_flattening=0.28,
+        directional_sh_scale=0.72,
+        sky_directional_sh_scale=0.60,
+    ),
+    "joyful": MoodConfig(
+        name="joyful",
+        valence=0.82,
+        arousal=0.74,
+        exposure_ev=0.22,
+        contrast=1.06,
+        saturation=1.16,
+        blue_tint_r=1.08,
+        blue_tint_g=1.02,
+        blue_tint_b=0.90,
+        ambient_floor=0.008,
+        ambient_tint_r=1.0,
+        ambient_tint_g=0.82,
+        ambient_tint_b=0.55,
+        highlight_preservation=0.22,
+        shadow_suppression=0.30,
+        illumination_flattening=0.12,
+        directional_sh_scale=0.95,
+        sky_directional_sh_scale=0.82,
+    ),
+    "tense": MoodConfig(
+        name="tense",
+        valence=-0.76,
+        arousal=0.82,
+        exposure_ev=-0.48,
+        contrast=1.20,
+        saturation=0.72,
+        blue_tint_r=0.70,
+        blue_tint_g=0.86,
+        blue_tint_b=1.10,
+        ambient_floor=0.008,
+        ambient_tint_r=0.16,
+        ambient_tint_g=0.42,
+        ambient_tint_b=0.58,
+        highlight_preservation=0.08,
+        shadow_suppression=0.18,
+        illumination_flattening=0.08,
+        directional_sh_scale=1.08,
+        sky_directional_sh_scale=0.90,
+    ),
+    "melancholic": MoodConfig(
+        name="melancholic",
+        valence=-0.72,
+        arousal=-0.62,
+        exposure_ev=-0.58,
+        contrast=0.91,
+        saturation=0.46,
+        blue_tint_r=0.72,
+        blue_tint_g=0.86,
+        blue_tint_b=1.08,
+        ambient_floor=0.010,
+        ambient_tint_r=0.32,
+        ambient_tint_g=0.50,
+        ambient_tint_b=0.86,
+        highlight_preservation=0.06,
+        shadow_suppression=0.58,
+        illumination_flattening=0.38,
+        directional_sh_scale=0.62,
+        sky_directional_sh_scale=0.52,
+    ),
+    "night": NightMoodConfig(),
+}
+
+
+def available_mood_presets() -> tuple[str, ...]:
+    return tuple(MOOD_PRESETS)
+
+
+def get_mood_preset(name: str) -> MoodConfig:
+    key = str(name).strip().lower()
+    if key not in MOOD_PRESETS:
+        available = ", ".join(available_mood_presets())
+        raise KeyError(f"Unknown mood preset '{name}'. Available: {available}")
+    return replace(MOOD_PRESETS[key])
+
+
+_CIRCUMPLEX_FIELDS = (
+    "exposure_ev",
+    "contrast",
+    "saturation",
+    "blue_tint_r",
+    "blue_tint_g",
+    "blue_tint_b",
+    "ambient_floor",
+    "ambient_tint_r",
+    "ambient_tint_g",
+    "ambient_tint_b",
+    "highlight_preservation",
+    "shadow_suppression",
+    "illumination_flattening",
+    "directional_sh_scale",
+    "sky_directional_sh_scale",
+)
+
+
+def mood_from_circumplex(
+    name: str,
+    valence: float,
+    arousal: float,
+    time_of_day: str = "day",
+) -> MoodConfig:
+    """Interpolate a continuous mood from the neutral and quadrant anchors."""
+    valence = float(np.clip(valence, -1.0, 1.0))
+    arousal = float(np.clip(arousal, -1.0, 1.0))
+    time_of_day = str(time_of_day).strip().lower()
+    if time_of_day not in {"day", "night"}:
+        raise ValueError("time_of_day must be 'day' or 'night'")
+
+    anchor_names = ("neutral", "serene", "joyful", "tense", "melancholic")
+    anchors = [MOOD_PRESETS[key] for key in anchor_names]
+    distances = np.array(
+        [
+            (valence - anchor.valence) ** 2
+            + (arousal - anchor.arousal) ** 2
+            for anchor in anchors
+        ],
+        dtype=np.float64,
+    )
+    exact = np.flatnonzero(distances < 1e-10)
+    if exact.size:
+        emotional = replace(anchors[int(exact[0])])
+    else:
+        weights = 1.0 / np.square(distances + 0.08)
+        weights /= weights.sum()
+        values = {
+            field: float(
+                sum(
+                    weight * float(getattr(anchor, field))
+                    for weight, anchor in zip(weights, anchors)
+                )
+            )
+            for field in _CIRCUMPLEX_FIELDS
+        }
+        emotional = MoodConfig(**values)
+
+    if time_of_day == "night":
+        base = NightMoodConfig()
+        neutral = MOOD_PRESETS["neutral"]
+        for field in _CIRCUMPLEX_FIELDS:
+            night_value = float(getattr(base, field))
+            emotional_offset = float(getattr(emotional, field)) - float(
+                getattr(neutral, field)
+            )
+            setattr(base, field, night_value + 0.35 * emotional_offset)
+        config = base
+    else:
+        config = emotional
+
+    config.name = _validate_mood_name(name)
+    config.valence = valence
+    config.arousal = arousal
+    config.time_of_day = time_of_day
+    config.sky_source = "night" if time_of_day == "night" else "day"
+    return config
 
 
 def _atomic_save_image(image: Image.Image, path: Path) -> None:
@@ -94,7 +301,7 @@ def _smoothstep(edge0: float, edge1: float, value: np.ndarray) -> np.ndarray:
 
 def _estimate_shadow_lift(
     rgb_u8: np.ndarray,
-    config: NightMoodConfig,
+    config: MoodConfig,
     exclusion_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Estimate a low-frequency multiplier that suppresses daytime cast shadows."""
@@ -174,7 +381,7 @@ def _estimate_shadow_lift(
 
 def _relight_non_sky(
     rgb_u8: np.ndarray,
-    config: NightMoodConfig,
+    config: MoodConfig,
     shadow_lift: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     rgb = np.asarray(rgb_u8, dtype=np.float32) / 255.0
@@ -203,7 +410,12 @@ def _relight_non_sky(
         dtype=np.float32,
     )
     relit += float(config.ambient_floor) * np.array(
-        [0.28, 0.46, 1.0], dtype=np.float32
+        [
+            config.ambient_tint_r,
+            config.ambient_tint_g,
+            config.ambient_tint_b,
+        ],
+        dtype=np.float32,
     )
 
     # Preserve only the strongest emissive-looking highlights. Broad sunlit
@@ -215,13 +427,26 @@ def _relight_non_sky(
     return np.clip(_linear_to_srgb(relit) * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
-def build_night_scene_erp(
+def _validate_mood_name(name: str) -> str:
+    normalized = str(name).strip().lower().replace(" ", "_")
+    if not normalized or any(
+        char not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for char in normalized
+    ):
+        raise ValueError(
+            "Mood names may contain only lowercase letters, digits, '_' and '-'"
+        )
+    return normalized
+
+
+def build_mood_scene_erp(
     scene_root: str | Path,
-    config: NightMoodConfig,
+    config: MoodConfig,
     metadata_path: Optional[str | Path] = None,
+    sky_composite_path: Optional[str | Path] = None,
 ) -> Path:
-    """Relight non-sky pixels and combine them with the generated night sky."""
+    """Relight a complete ERP according to a circumplex mood configuration."""
     scene_root = Path(scene_root).expanduser().resolve()
+    mood_name = _validate_mood_name(config.name)
     metadata_path = (
         Path(metadata_path).expanduser().resolve()
         if metadata_path
@@ -231,20 +456,31 @@ def build_night_scene_erp(
     sky_meta = metadata.get("sky") or {}
     source_path = scene_root / "rgb.png"
     mask_path = scene_root / str(sky_meta.get("mask_path", "traindata/sky/mask.png"))
-    night_sky_path = scene_root / str(
-        sky_meta.get("night_composite_path", "traindata/sky/night_composite.png")
-    )
-    for path in (source_path, mask_path, night_sky_path):
+    if sky_composite_path is not None:
+        mood_sky_path = Path(sky_composite_path).expanduser().resolve()
+    elif config.sky_source == "night":
+        mood_sky_path = scene_root / str(
+            sky_meta.get(
+                "night_composite_path",
+                "traindata/sky/night_composite.png",
+            )
+        )
+    else:
+        mood_sky_path = source_path
+
+    for path in (source_path, mask_path, mood_sky_path):
         if not path.exists():
             raise FileNotFoundError(f"Missing mood input: {path}")
 
     source = np.asarray(Image.open(source_path).convert("RGB"), dtype=np.uint8)
-    night_sky = np.asarray(Image.open(night_sky_path).convert("RGB"), dtype=np.uint8)
+    mood_sky = np.asarray(
+        Image.open(mood_sky_path).convert("RGB"), dtype=np.uint8
+    )
     sky_mask = np.asarray(Image.open(mask_path).convert("L"), dtype=np.uint8) >= 128
-    if source.shape != night_sky.shape or sky_mask.shape != source.shape[:2]:
+    if source.shape != mood_sky.shape or sky_mask.shape != source.shape[:2]:
         raise ValueError(
             f"Mood input shape mismatch: source={source.shape}, "
-            f"night={night_sky.shape}, mask={sky_mask.shape}"
+            f"sky={mood_sky.shape}, mask={sky_mask.shape}"
         )
 
     output = np.empty_like(source)
@@ -258,28 +494,50 @@ def build_night_scene_erp(
             shadow_lift=shadow_lift[row0:row1],
         )
         mask_chunk = sky_mask[row0:row1]
+        sky_chunk = mood_sky[row0:row1]
+        if config.sky_source != "night":
+            sky_chunk = _relight_non_sky(sky_chunk, config)
         output[row0:row1] = np.where(
             mask_chunk[..., None],
-            night_sky[row0:row1],
+            sky_chunk,
             relit,
         )
 
-    mood_dir = scene_root / "traindata" / "moods" / "night"
+    mood_dir = scene_root / "traindata" / "moods" / mood_name
     scene_path = mood_dir / "scene_rgb.png"
     _atomic_save_image(Image.fromarray(output), scene_path)
     manifest = {
-        "name": "night",
+        "name": mood_name,
+        "circumplex": {
+            "valence": float(np.clip(config.valence, -1.0, 1.0)),
+            "arousal": float(np.clip(config.arousal, -1.0, 1.0)),
+        },
+        "time_of_day": config.time_of_day,
         "status": "erp_ready",
         "scene_erp_path": str(scene_path.relative_to(scene_root)),
         "source_day_erp_path": str(source_path.relative_to(scene_root)),
         "sky_mask_path": str(mask_path.relative_to(scene_root)),
-        "night_sky_composite_path": str(night_sky_path.relative_to(scene_root)),
+        "sky_source": config.sky_source,
+        "sky_composite_path": str(mood_sky_path.relative_to(scene_root)),
         "config": asdict(config),
     }
     _atomic_write_json(manifest, mood_dir / "mood.json")
-    metadata.setdefault("moods", {})["night"] = manifest
+    metadata.setdefault("moods", {})[mood_name] = manifest
     _atomic_write_json(metadata, metadata_path)
     return scene_path
+
+
+def build_night_scene_erp(
+    scene_root: str | Path,
+    config: NightMoodConfig,
+    metadata_path: Optional[str | Path] = None,
+) -> Path:
+    """Backward-compatible wrapper for the original night-only workflow."""
+    return build_mood_scene_erp(
+        scene_root=scene_root,
+        config=config,
+        metadata_path=metadata_path,
+    )
 
 
 def _erp_indices_for_points(
@@ -301,7 +559,7 @@ def adapt_gaussian_ply_to_erp(
     target_ply: str | Path,
     target_erp_path: str | Path,
     sky_mask_path: str | Path,
-    config: NightMoodConfig,
+    config: MoodConfig,
     sky_radius: float = 0.0,
 ) -> dict:
     """Fit SH colors to an ERP while preserving every Gaussian and its geometry."""
@@ -422,7 +680,16 @@ def write_mood_manifest(scene_root: str | Path, payload: dict) -> Path:
     current = {}
     if manifest_path.exists():
         current = json.loads(manifest_path.read_text(encoding="utf-8"))
-    current.setdefault("version", 1)
+    current["version"] = max(2, int(current.get("version", 1)))
+    current.setdefault(
+        "space",
+        {
+            "model": "circumplex",
+            "valence_range": [-1.0, 1.0],
+            "arousal_range": [-1.0, 1.0],
+            "time_of_day_independent": True,
+        },
+    )
     current.setdefault("moods", {}).update(payload.get("moods", {}))
     if payload.get("active_mood"):
         current["active_mood"] = payload["active_mood"]

@@ -39,16 +39,14 @@ N_VIEWS="${N_VIEWS:-12}"
 PHI_BANDS="${PHI_BANDS:-80,67.5,45,0,-45,-67.5,-80}"
 PERSPECTIVE_SIZE="${PERSPECTIVE_SIZE:-1024}"
 
-# GROUNDING_PROMPTS="${GROUNDING_PROMPTS:-sky . road . pavement . grass . leaves . tree . bush . person . plant}"
-# GROUNDING_PROMPTS="${GROUNDING_PROMPTS:-sky . mountain . person . table . bench . building . railing . house . snow . rock}"
-GROUNDING_PROMPTS="${GROUNDING_PROMPTS:-sky . road . pavement . grass . leaves . tree . bush . plant . stairway . fence . monument . lightpole}"
+GROUNDING_PROMPTS="${GROUNDING_PROMPTS:-sky . road . pavement . grass . leaves . leaf . tree . trees . bush . shrub . plant . vegetation . foliage . branches . forest . stairway . fence . monument . lightpole}"
 GROUNDING_BOX_THRESHOLD="${GROUNDING_BOX_THRESHOLD:-0.18}"
 GROUNDING_TEXT_THRESHOLD="${GROUNDING_TEXT_THRESHOLD:-0.15}"
 GROUNDING_MASK_MIN_AREA="${GROUNDING_MASK_MIN_AREA:-500}"
 GROUNDING_INFER_MAX_SIDE="${GROUNDING_INFER_MAX_SIDE:-1536}"
-GROUNDING_BOX_PADDING="${GROUNDING_BOX_PADDING:-0.00}"
-GROUNDING_MORPH_OPEN_KERNEL="${GROUNDING_MORPH_OPEN_KERNEL:-9}"
-GROUNDING_MIN_COMPONENT_AREA_RATIO="${GROUNDING_MIN_COMPONENT_AREA_RATIO:-0.08}"
+GROUNDING_BOX_PADDING="${GROUNDING_BOX_PADDING:-0.12}"
+GROUNDING_MORPH_OPEN_KERNEL="${GROUNDING_MORPH_OPEN_KERNEL:-3}"
+GROUNDING_MIN_COMPONENT_AREA_RATIO="${GROUNDING_MIN_COMPONENT_AREA_RATIO:-0.01}"
 SKY_SEGMENTATION_BACKEND="${SKY_SEGMENTATION_BACKEND:-hybrid}"
 SKY_SEGFORMER_MODEL="${SKY_SEGFORMER_MODEL:-nvidia/segformer-b2-finetuned-ade-512-512}"
 SKY_SEGFORMER_MAX_SIDE="${SKY_SEGFORMER_MAX_SIDE:-2048}"
@@ -82,10 +80,15 @@ fi
 
 RETEXTURE_NIGHT_SKY="${RETEXTURE_NIGHT_SKY:-0}"
 BUILD_NIGHT_MOOD="${BUILD_NIGHT_MOOD:-$RETEXTURE_NIGHT_SKY}"
+MOOD_PRESETS="${MOOD_PRESETS:-}"
 SKY_MODEL_PATH="${SKY_MODEL_PATH:-checkpoints/FLUX.1-Fill-dev}"
 SKY_STEPS="${SKY_STEPS:-50}"
 SKY_SEED="${SKY_SEED:-42}"
 SKY_MAX_PIXELS="${SKY_MAX_PIXELS:-1048576}"
+SKY_VAE_TILING="${SKY_VAE_TILING:-0}"
+SKY_STAR_DENSITY="${SKY_STAR_DENSITY:-0.00065}"
+SKY_LUMA_CAP="${SKY_LUMA_CAP:-0.42}"
+SKY_HOTSPOT_RATIO="${SKY_HOTSPOT_RATIO:-1.55}"
 NIGHT_MOOD_REFINE_ITERS="${NIGHT_MOOD_REFINE_ITERS:-0}"
 NIGHT_TRAINING_IMAGE_SIZE="${NIGHT_TRAINING_IMAGE_SIZE:-512}"
 MOOD_ARGS=()
@@ -96,7 +99,13 @@ if [[ "$RETEXTURE_NIGHT_SKY" != "0" ]]; then
     --sky_steps "$SKY_STEPS"
     --sky_seed "$SKY_SEED"
     --sky_max_pixels "$SKY_MAX_PIXELS"
+    --sky_star_density "$SKY_STAR_DENSITY"
+    --sky_luma_cap "$SKY_LUMA_CAP"
+    --sky_hotspot_ratio "$SKY_HOTSPOT_RATIO"
   )
+  if [[ "$SKY_VAE_TILING" != "0" ]]; then
+    MOOD_ARGS+=(--sky_vae_tiling)
+  fi
 fi
 if [[ "$BUILD_NIGHT_MOOD" != "0" ]]; then
   MOOD_ARGS+=(
@@ -104,6 +113,9 @@ if [[ "$BUILD_NIGHT_MOOD" != "0" ]]; then
     --night_mood_refine_iters "$NIGHT_MOOD_REFINE_ITERS"
     --night_training_image_size "$NIGHT_TRAINING_IMAGE_SIZE"
   )
+fi
+if [[ -n "$MOOD_PRESETS" ]]; then
+  MOOD_ARGS+=(--mood_presets "$MOOD_PRESETS")
 fi
 
 echo "[3/3] Training and merging standard-quality 3DGS scene"

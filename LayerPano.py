@@ -2,6 +2,7 @@
 import os
 import datetime
 import time
+from benchmark.runtime_hooks import pipeline_stage
 import warnings
 from random import randint
 from loguru import logger
@@ -380,26 +381,36 @@ class LayerPano:
                     os.path.join(self.save_dir, f"gsplat_layer{layer_idx}.ply"),
                     type="mps-splat-apple",
                 )
-                train_with_splat_apple(
-                    self.traindata,
-                    outfile,
-                    num_iterations=n_iterations,
-                    rasterizer=self.mps_rasterizer,
-                    device=self.device,
-                    adaptive=(not self.no_adaptive),
-                    max_points=self.max_points,
-                    downsample_ratio=self.downsample_ratio,
-                    repulsion_weight=self.repulsion_weight,
-                    mean_lr_scale=self.mean_lr_scale,
-                    early_stop_patience=self.early_stop_patience,
-                    early_stop_min_delta=self.early_stop_min_delta,
-                    lr_plateau_patience=self.lr_plateau_patience,
-                    lr_plateau_factor=self.lr_plateau_factor,
-                    lr_plateau_min_lr=self.lr_plateau_min_lr,
-                    prev_gaussian_params=None,
-                    prev_gaussian_labels=None,
-                    training_profile="layer_instances",
+                stage_kind = (
+                    "sky_training" if sky_idx is not None and layer_idx == sky_idx
+                    else "background_training" if background_idx is not None and layer_idx == background_idx
+                    else "per_layer_training"
                 )
+                with pipeline_stage(
+                    stage_kind, iterations=n_iterations,
+                    input_points=len(self.traindata.get("pcd_points", [])),
+                    layer_index=layer_idx,
+                ):
+                    train_with_splat_apple(
+                        self.traindata,
+                        outfile,
+                        num_iterations=n_iterations,
+                        rasterizer=self.mps_rasterizer,
+                        device=self.device,
+                        adaptive=(not self.no_adaptive),
+                        max_points=self.max_points,
+                        downsample_ratio=self.downsample_ratio,
+                        repulsion_weight=self.repulsion_weight,
+                        mean_lr_scale=self.mean_lr_scale,
+                        early_stop_patience=self.early_stop_patience,
+                        early_stop_min_delta=self.early_stop_min_delta,
+                        lr_plateau_patience=self.lr_plateau_patience,
+                        lr_plateau_factor=self.lr_plateau_factor,
+                        lr_plateau_min_lr=self.lr_plateau_min_lr,
+                        prev_gaussian_params=None,
+                        prev_gaussian_labels=None,
+                        training_profile="layer_instances",
+                    )
                 output_paths.append(outfile)
                 print(
                     f"[timing] layer={layer_idx} iterations={n_iterations} "
@@ -439,56 +450,6 @@ class LayerPano:
         videopath = os.path.join(self.save_dir, 'results', f'{preset}_v{phi}.mp4')
         depthpath = os.path.join(self.save_dir, 'results', f'depth_{preset}_v{phi}.mp4')
         
-        views = []
-
-        
-        for i in range(len(poses)):
-            pose = poses[i]
-            cur_cam = MiniCam2(pose, self.cam.W, self.cam.H, self.cam.fovx, self.cam.fovy)
-            views.append(cur_cam)
-            
-        framelist = []
-        depthlist = []
-        dmin, dmax = 1e8, -1e8
-
-
-        iterable_render = views
-
-        for view in iterable_render:
-            results = render(view, self.gaussians, self.opt, self.background)
-            frame, depth = results['render'], results['depth']
-            framelist.append(
-                np.round(frame.permute(1,2,0).detach().cpu().numpy().clip(0,1)*255.).astype(np.uint8))
-            depth = -(depth * (depth > 0)).detach().cpu().numpy()
-            dmin_local = depth.min().item()
-            dmax_local = depth.max().item()
-            if dmin_local < dmin:
-                dmin = dmin_local
-            if dmax_local > dmax:
-                dmax = dmax_local
-            depthlist.append(depth)
-
-
-        # depthlist = [colorize(depth, vmin=dmin, vmax=dmax) for depth in depthlist]
-        depthlist = [colorize(depth) for depth in depthlist]
-        if not os.path.exists(videopath):
-            imageio.mimwrite(videopath, framelist, fps=10, quality=8)
-        if not os.path.exists(depthpath):
-            imageio.mimwrite(depthpath, depthlist, fps=10, quality=8)
-        return videopath, depthpath
-
-    def render_video(self, preset, phi=0):
-        
-        if preset == '360':
-            preset='pers2pano'
-            poses, theta_list, phi_list = get_pcdGenPoses(preset, {'n_views': 80, 'phi': phi})
-        else:
-            poses = get_pcdGenPoses(preset)
-
-        
-        videopath = os.path.join(self.save_dir, 'results', f'{preset}_v{phi}.mp4')
-        depthpath = os.path.join(self.save_dir, 'results', f'depth_{preset}_v{phi}.mp4')
-        
 
         views = []
 
@@ -500,7 +461,6 @@ class LayerPano:
             
         framelist = []
         depthlist = []
-        dmin, dmax = 1e8, -1e8
 
 
         iterable_render = views
@@ -511,16 +471,9 @@ class LayerPano:
             framelist.append(
                 np.round(frame.permute(1,2,0).detach().cpu().numpy().clip(0,1)*255.).astype(np.uint8))
             depth = -(depth * (depth > 0)).detach().cpu().numpy()
-            dmin_local = depth.min().item()
-            dmax_local = depth.max().item()
-            if dmin_local < dmin:
-                dmin = dmin_local
-            if dmax_local > dmax:
-                dmax = dmax_local
             depthlist.append(depth)
 
 
-        # depthlist = [colorize(depth, vmin=dmin, vmax=dmax) for depth in depthlist]
         depthlist = [colorize(depth) for depth in depthlist]
         if not os.path.exists(videopath):
             imageio.mimwrite(videopath, framelist, fps=10, quality=8)

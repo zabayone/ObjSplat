@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Switch the active ObjSplat day/night PLY without copying scene data."""
+"""Switch the active ObjSplat mood PLY without copying scene data."""
 
 from __future__ import annotations
 
@@ -52,7 +52,11 @@ def switch_mood(scene_root: str | Path, mood: str) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scene_root", required=True)
-    parser.add_argument("--mood", required=True, choices=["day", "night"])
+    parser.add_argument(
+        "--mood",
+        required=True,
+        help="Mood name registered in scene/moods.json",
+    )
     args = parser.parse_args()
     switch_mood(args.scene_root, args.mood)
 

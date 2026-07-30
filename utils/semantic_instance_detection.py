@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
+import time
 
 import numpy as np
 import torch
 import cv2
 from PIL import Image
+from benchmark.runtime_hooks import record_stage
 
 try:
     from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
@@ -37,6 +39,38 @@ try:
 except Exception:
     build_sam2 = None  # type: ignore[assignment]
     SAM2ImagePredictor = None  # type: ignore[assignment]
+
+
+def _label_tokens(label: Optional[str]) -> set[str]:
+    raw = str(label or "").strip().lower()
+    if not raw:
+        return set()
+    return {part for part in raw.replace("/", " ").replace("-", " ").replace("_", " ").split() if part}
+
+
+def _is_vegetation_label(label: Optional[str]) -> bool:
+    tokens = _label_tokens(label)
+    vegetation_tokens = {
+        "tree",
+        "trees",
+        "plant",
+        "plants",
+        "bush",
+        "bushes",
+        "shrub",
+        "shrubs",
+        "grass",
+        "vegetation",
+        "foliage",
+        "forest",
+        "wood",
+        "woods",
+        "leaf",
+        "leaves",
+        "branch",
+        "branches",
+    }
+    return bool(tokens & vegetation_tokens)
 
 
 class SemanticInstanceDetector:
@@ -417,11 +451,11 @@ def detect_objects_grounding_then_sam_on_panorama(
     multimask_output: bool = True,
     min_mask_area: int = 1500,
     sam2_config: Optional[str] = None,
-    box_padding_ratio: float = 0.15,
+    box_padding_ratio: float = 0.12,
     grounding_infer_max_side: int = 1024,
     box_nms_threshold: float = 0.75,
-    min_component_area_ratio: float = 0.02,
-    morph_open_kernel: int = 5,
+    min_component_area_ratio: float = 0.01,
+    morph_open_kernel: int = 3,
 ) -> Dict[str, Any]:
     """Run GroundingDINO to get boxes, then run SAM predictor on those boxes.
 
@@ -444,6 +478,7 @@ def detect_objects_grounding_then_sam_on_panorama(
     det_boxes: List[Tuple[np.ndarray, str, float]] = []
     grounding_error: Optional[str] = None
     grounding_succeeded = False
+    grounding_started = time.perf_counter()
     if use_grounding and GROUNDING_DINO_AVAILABLE:
         try:
             model_id = "IDEA-Research/grounding-dino-base"
@@ -506,6 +541,11 @@ def detect_objects_grounding_then_sam_on_panorama(
             grounding_error = str(e)
     elif use_grounding:
         grounding_error = "transformers GroundingDINO support is unavailable"
+    record_stage(
+        "object_detection",
+        time.perf_counter() - grounding_started,
+        status="success" if grounding_succeeded or not use_grounding else "failed",
+    )
 
     if not det_boxes:
         det_boxes = [(np.array([0, 0, w, h], dtype=np.float32), "panorama", 0.0)]
@@ -618,12 +658,31 @@ def detect_objects_grounding_then_sam_on_panorama(
 
     def _clean_prompt_mask(mask: np.ndarray, box: np.ndarray, label: str) -> np.ndarray:
         label_norm = str(label).strip().lower()
-        if "sky" in {part for part in label_norm.replace("/", " ").split() if part}:
+        label_tokens = _label_tokens(label)
+        if "sky" in label_tokens:
             # GroundingDINO boxes are often much tighter than the actual sky,
             # especially on 2:1 ERPs. SAM already predicts the semantic region;
             # clipping it back to the detection box collapses the sky to a
             # narrow strip and destroys gaps between vegetation.
             return np.asarray(mask, dtype=bool)
+        if _is_vegetation_label(label):
+            # Trees, shrubs, and foliage often fragment into thin crowns and
+            # disconnected branches. Preserve their full SAM extent instead of
+            # trimming the mask back to the detection box and discarding the
+            # outer canopy.
+            mask_u8 = np.asarray(mask, dtype=np.uint8)
+            if int(mask_u8.sum()) == 0:
+                return np.asarray(mask, dtype=bool)
+            k = max(3, int(round(min(w, h) / 320.0)))
+            if k % 2 == 0:
+                k += 1
+            kernel = np.ones((k, k), np.uint8)
+            mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
+            expanded_box = _expand_box(box, w, h, max(float(box_padding_ratio), 0.18))
+            clipped = _mask_inside_box(mask_u8.astype(bool), expanded_box)
+            if int(clipped.sum()) >= max(1, int(mask_u8.sum() * 0.35)):
+                return clipped
+            return mask_u8.astype(bool)
         expanded_box = _expand_box(box, w, h, box_padding_ratio)
         clipped = _mask_inside_box(mask, expanded_box)
         clipped = _keep_significant_component(clipped, box)
@@ -632,7 +691,7 @@ def detect_objects_grounding_then_sam_on_panorama(
     def _mask_priority(record: Tuple[np.ndarray, str, float]) -> Tuple[int, int, float]:
         mask, label, score = record
         label_norm = str(label).strip().lower()
-        label_tokens = {part for part in label_norm.replace("/", " ").split() if part}
+        label_tokens = _label_tokens(label_norm)
         stuff_labels = {
             "sky",
             "road",
@@ -705,6 +764,7 @@ def detect_objects_grounding_then_sam_on_panorama(
 
     sam_error: Optional[str] = None
     sam_succeeded = False
+    segmentation_started = time.perf_counter()
     try:
         mask_records = _predict_box_masks()
         sam_succeeded = bool(mask_records)
@@ -714,6 +774,11 @@ def detect_objects_grounding_then_sam_on_panorama(
         print(f"[WARN] SAM box prompting failed, falling back to full-panorama mask: {e}")
         sam_error = str(e)
         mask_records = [(np.ones((h, w), dtype=bool), "panorama-fallback", 0.0)]
+    record_stage(
+        "segmentation",
+        time.perf_counter() - segmentation_started,
+        status="success" if sam_succeeded else "failed",
+    )
 
     instance_map = np.zeros((h, w), dtype=np.int32)
     masks: Dict[int, np.ndarray] = {}

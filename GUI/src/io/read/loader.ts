@@ -52,7 +52,7 @@ const columnTypeToGSplatType = (colType: ColumnType | null): string => {
 const dataTableToGSplatData = (dataTable: DataTable): GSplatData => {
     // Diagnostic logging for ASCII PLY loads with unexpected numeric values.
     // This helps verify the actual column storage types before GSplatData consumes them.
-    // eslint-disable-next-line no-console
+
     console.log('DataTable columns:', dataTable.columns.map((col: Column) => ({
         name: col.name,
         dataType: col.dataType,
@@ -62,7 +62,7 @@ const dataTableToGSplatData = (dataTable: DataTable): GSplatData => {
     })));
 
     const properties = dataTable.columns
-        .map((col: Column) => ({
+    .map((col: Column) => ({
         type: columnTypeToGSplatType(col.dataType),
         name: col.name,
         storage: col.data,
@@ -139,7 +139,7 @@ const loadGSplatData = async (filename: string, fileSystem: ReadFileSystem, skip
         sortMortonOrder(tables[0], indices);
         tables[0].permuteRowsInPlace(indices);
     } else if (inputFormat !== 'sog' && !isCompressedPly && !skipReorder && tables[0].numRows > MAX_ROWS_FOR_MORTON_REORDER) {
-        // eslint-disable-next-line no-console
+
         console.warn(`Skipping Morton reorder for large dataset (${tables[0].numRows} splats)`);
     }
 

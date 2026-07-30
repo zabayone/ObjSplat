@@ -8,6 +8,7 @@ import { registerEditorEvents } from './editor';
 import { Events } from './events';
 import { initFileHandler } from './file-handler';
 import { registerIframeApi } from './iframe-api';
+import { initMoodPanel } from './mood-panel';
 import { registerPlySequenceEvents } from './ply-sequence';
 import { registerPublishEvents } from './publish';
 import { registerRenderEvents } from './render';
@@ -264,6 +265,15 @@ const main = async () => {
         }]);
     }
 
+    const moodManifestUrl = url.searchParams.get('moodManifest');
+    const moodRootUrl = url.searchParams.get('moodRoot');
+    if (moodManifestUrl && moodRootUrl) {
+        try {
+            await initMoodPanel(events, moodManifestUrl, moodRootUrl);
+        } catch (error) {
+            console.error('Unable to initialize ObjSplat mood controls:', error);
+        }
+    }
 
     // handle OS-based file association in PWA mode
     if ('launchQueue' in window) {

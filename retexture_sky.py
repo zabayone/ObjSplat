@@ -26,6 +26,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mask_feather_px", type=int, default=9)
     parser.add_argument("--circular_padding_ratio", type=float, default=0.0625)
     parser.add_argument("--min_sky_coverage", type=float, default=0.005)
+    parser.add_argument("--star_density", type=float, default=0.00065)
+    parser.add_argument("--star_luma_threshold", type=int, default=145)
+    parser.add_argument("--sky_luma_cap", type=float, default=0.42)
+    parser.add_argument("--sky_hotspot_ratio", type=float, default=1.55)
+    parser.add_argument(
+        "--vae_tiling",
+        action="store_true",
+        help="Enable memory-saving tiled VAE decoding; may introduce texture bands",
+    )
     parser.add_argument("--device", default="mps", choices=["mps", "cuda", "cpu"])
     parser.add_argument("--no_cpu_offload", action="store_true")
     parser.add_argument("--dry_run", action="store_true", help="Validate inputs without loading FLUX")
@@ -45,6 +54,11 @@ def main() -> None:
         mask_feather_px=args.mask_feather_px,
         circular_padding_ratio=args.circular_padding_ratio,
         min_sky_coverage=args.min_sky_coverage,
+        star_density=args.star_density,
+        star_luma_threshold=args.star_luma_threshold,
+        sky_luma_cap=args.sky_luma_cap,
+        sky_hotspot_ratio=args.sky_hotspot_ratio,
+        vae_tiling=args.vae_tiling,
         device=args.device,
         cpu_offload=not args.no_cpu_offload,
     )

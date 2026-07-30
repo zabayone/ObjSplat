@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import json
 import os
 import re
 import socket
@@ -195,35 +196,112 @@ def start_file_server(directory: Path) -> tuple[ThreadingHTTPServer, threading.T
     return server, thread, port
 
 
-def build_viewer_url(file_url: str, filename: str, cache_bust: str) -> str:
-    query = urllib.parse.urlencode({
+def build_viewer_url(
+    file_url: str,
+    filename: str,
+    cache_bust: str,
+    mood_manifest_url: str | None = None,
+    mood_root_url: str | None = None,
+) -> str:
+    params = {
         "load": file_url,
         "filename": filename,
         "localViewer": "1",
         "cacheBust": cache_bust,
-    })
+    }
+    if mood_manifest_url:
+        params["moodManifest"] = mood_manifest_url
+    if mood_root_url:
+        params["moodRoot"] = mood_root_url
+    query = urllib.parse.urlencode(params)
     return f"{VIEWER_URL}?{query}"
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Open a .ply file in SuperSplat.")
-    parser.add_argument("ply_path", type=Path, help="Path to the .ply file")
-    args = parser.parse_args()
+def resolve_scene_context(input_path: Path) -> tuple[Path, Path, Path | None]:
+    """Resolve the selected PLY, HTTP root and optional mood manifest."""
+    input_path = input_path.expanduser().resolve()
+    manifest_path: Path | None = None
+    scene_root: Path | None = None
 
-    ply_path = args.ply_path.expanduser().resolve()
+    if input_path.is_dir():
+        if (input_path / "scene" / "moods.json").exists():
+            scene_root = input_path
+            manifest_path = input_path / "scene" / "moods.json"
+        elif input_path.name == "scene" and (input_path / "moods.json").exists():
+            scene_root = input_path.parent
+            manifest_path = input_path / "moods.json"
+        else:
+            raise FileNotFoundError(
+                f"Directory does not contain scene/moods.json: {input_path}"
+            )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        moods = manifest.get("moods") or {}
+        active_name = str(manifest.get("active_mood") or "day")
+        active_entry = moods.get(active_name) or moods.get("day")
+        if not active_entry or not active_entry.get("ply_path"):
+            raise ValueError(f"Mood manifest has no loadable active mood: {manifest_path}")
+        ply_path = (scene_root / str(active_entry["ply_path"])).resolve()
+    else:
+        ply_path = input_path
+        if ply_path.parent.name == "scene":
+            candidate = ply_path.parent / "moods.json"
+            if candidate.exists():
+                scene_root = ply_path.parent.parent
+                manifest_path = candidate
+
     if not ply_path.exists():
         raise FileNotFoundError(ply_path)
     if ply_path.suffix.lower() != ".ply":
         raise ValueError("The input file must have a .ply extension")
 
-    file_server, file_server_thread, file_port = start_file_server(ply_path.parent)
+    server_root = scene_root if scene_root is not None else ply_path.parent
+    try:
+        ply_path.relative_to(server_root)
+    except ValueError as exc:
+        raise ValueError("PLY must be inside the local scene root") from exc
+    return ply_path, server_root, manifest_path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Open a PLY or mood-enabled ObjSplat scene in SuperSplat."
+    )
+    parser.add_argument(
+        "scene_path",
+        type=Path,
+        help="Path to a .ply file, ObjSplat scene root, or scene/ directory",
+    )
+    args = parser.parse_args()
+
+    ply_path, server_root, manifest_path = resolve_scene_context(args.scene_path)
+
+    file_server, file_server_thread, file_port = start_file_server(server_root)
     viewer_process = start_viewer_if_needed()
 
     try:
         wait_for_http(VIEWER_URL, timeout_seconds=180)
         cache_bust = str(int(time.time() * 1000))
-        file_url = f"http://127.0.0.1:{file_port}/{urllib.parse.quote(ply_path.name)}?v={cache_bust}"
-        viewer_url = build_viewer_url(file_url, ply_path.name, cache_bust)
+        relative_ply = ply_path.relative_to(server_root).as_posix()
+        file_url = (
+            f"http://127.0.0.1:{file_port}/"
+            f"{urllib.parse.quote(relative_ply, safe='/')}?v={cache_bust}"
+        )
+        mood_manifest_url = None
+        mood_root_url = None
+        if manifest_path is not None:
+            relative_manifest = manifest_path.relative_to(server_root).as_posix()
+            mood_manifest_url = (
+                f"http://127.0.0.1:{file_port}/"
+                f"{urllib.parse.quote(relative_manifest, safe='/')}?v={cache_bust}"
+            )
+            mood_root_url = f"http://127.0.0.1:{file_port}/"
+        viewer_url = build_viewer_url(
+            file_url,
+            ply_path.name,
+            cache_bust,
+            mood_manifest_url=mood_manifest_url,
+            mood_root_url=mood_root_url,
+        )
         print(f"Opening SuperSplat: {viewer_url}")
         webbrowser.open(viewer_url, new=1)
         print("Keep this terminal open until the file finishes loading. Press Ctrl+C to stop the local file server.")

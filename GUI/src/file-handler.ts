@@ -299,12 +299,12 @@ const initFileHandler = (scene: Scene, events: Events, dropTarget: HTMLElement) 
                 const gsplatData: any = (model as any)?.splatData ?? (model as any)?.asset?.resource?.gsplatData;
                 if (gsplatData) {
                     // basic info
-                    // eslint-disable-next-line no-console
+
                     console.log('GSplatData loaded:', { numSplats: gsplatData.numSplats });
                     try {
                         const vertex = gsplatData.getElement('vertex');
                         if (vertex && vertex.properties) {
-                            // eslint-disable-next-line no-console
+
                             console.log('vertex properties:', vertex.properties.map((p: any) => ({ name: p.name, type: p.type, byteSize: p.byteSize })));
 
                             const sample: any = {};
@@ -318,19 +318,19 @@ const initFileHandler = (scene: Scene, events: Events, dropTarget: HTMLElement) 
                                     // ignore property sampling errors
                                 }
                             });
-                            // eslint-disable-next-line no-console
+
                             console.log('vertex property sample (first 5):', sample);
                         }
                     } catch (e) {
-                        // eslint-disable-next-line no-console
+
                         console.warn('Could not inspect gsplat vertex element:', e);
                     }
                 } else {
-                    // eslint-disable-next-line no-console
+
                     console.log('Loaded model has no gsplatData:', model);
                 }
             } catch (e) {
-                // eslint-disable-next-line no-console
+
                 console.error('Error while logging GSplatData diagnostics:', e);
             }
 
@@ -338,7 +338,7 @@ const initFileHandler = (scene: Scene, events: Events, dropTarget: HTMLElement) 
             try {
                 await scene.add(model);
             } catch (e) {
-                // eslint-disable-next-line no-console
+
                 console.error('Error adding model to scene:', e);
                 const displayName = files[0]?.filename ?? 'unknown';
                 await showLoadError(e.message ?? e, displayName);
