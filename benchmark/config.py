@@ -92,6 +92,15 @@ def validate_config(config: dict) -> None:
     evaluation = float(splits.get("evaluation_fraction", 0.2))
     if train <= 0 or evaluation < 0 or abs(train + evaluation - 1.0) > 1e-6:
         raise ValueError("training/evaluation fractions must be non-negative and sum to 1")
+    valid_layer_selectors = {"smallest", "median", "largest", "all"}
+    for selector in config.get("selected_layers", []):
+        if isinstance(selector, int) or str(selector).lstrip("-").isdigit():
+            continue
+        if str(selector).strip().lower() not in valid_layer_selectors:
+            raise ValueError(
+                "selected_layers entries must be integers or one of "
+                "smallest, median, largest, all"
+            )
     for index, ablation in enumerate(config.get("ablations") or []):
         if not isinstance(ablation, dict) or not ablation.get("name"):
             raise ValueError(f"ablations[{index}] requires a name")

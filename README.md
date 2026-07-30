@@ -205,6 +205,9 @@ and [benchmark/METHODOLOGY.md](benchmark/METHODOLOGY.md).
 - `utils/semantic_instance_detection.py`: GroundingDINO + SAM/SAM2 detection and mask cleanup.
 - `utils/open_ply_in_supersplat.py`: helper to inspect PLY outputs in SuperSplat.
 - `benchmark/run_benchmark.py`: multi-scene benchmark orchestrator.
+- `benchmark/configs/scientific_core.yaml`: default thesis protocol with a
+  controlled Gaussian budget, paired monolithic baseline, held-out fidelity,
+  multi-size edit targets, rendering, memory, and day/night topology metrics.
 - `benchmark/schemas.py`: stable machine-readable CSV schemas.
 - `benchmark/configs/`: smoke, complete, thesis, and ablation configurations.
 - `benchmark/run_evaluation_suite.sh`: six-scene evaluation entry point.

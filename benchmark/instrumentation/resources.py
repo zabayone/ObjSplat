@@ -17,34 +17,49 @@ except ImportError:  # optional
 
 
 def memory_snapshot() -> dict:
+    result = {
+        "process_rss_bytes": None, "process_vms_bytes": None,
+        "system_total_bytes": None, "system_available_bytes": None,
+        "system_used_bytes": None, "system_used_percent": None,
+        "swap_total_bytes": None, "swap_used_bytes": None,
+        "process_cpu_percent": None,
+    }
     if psutil is None:
-        return {
-            "process_rss_bytes": None, "process_vms_bytes": None,
-            "system_total_bytes": None, "system_available_bytes": None,
-            "system_used_bytes": None, "system_used_percent": None,
-            "swap_total_bytes": None, "swap_used_bytes": None,
-            "process_cpu_percent": None,
-        }
-    process = psutil.Process(os.getpid())
-    mem = process.memory_info()
+        return result
+    try:
+        process = psutil.Process(os.getpid())
+        mem = process.memory_info()
+        result["process_rss_bytes"] = int(mem.rss)
+        result["process_vms_bytes"] = int(mem.vms)
+        result["process_cpu_percent"] = float(process.cpu_percent(interval=None))
+    except (OSError, PermissionError, psutil.Error):
+        return result
     child_mem = []
     try:
         child_mem = [child.memory_info() for child in process.children(recursive=True)]
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+    except (OSError, PermissionError, psutil.Error):
         pass
-    vm = psutil.virtual_memory()
-    swap = psutil.swap_memory()
-    return {
-        "process_rss_bytes": int(mem.rss + sum(item.rss for item in child_mem)),
-        "process_vms_bytes": int(mem.vms + sum(item.vms for item in child_mem)),
-        "system_total_bytes": int(vm.total),
-        "system_available_bytes": int(vm.available),
-        "system_used_bytes": int(vm.used),
-        "system_used_percent": float(vm.percent),
-        "swap_total_bytes": int(swap.total),
-        "swap_used_bytes": int(swap.used),
-        "process_cpu_percent": float(process.cpu_percent(interval=None)),
-    }
+    result["process_rss_bytes"] = int(mem.rss + sum(item.rss for item in child_mem))
+    result["process_vms_bytes"] = int(mem.vms + sum(item.vms for item in child_mem))
+    try:
+        vm = psutil.virtual_memory()
+        result.update({
+            "system_total_bytes": int(vm.total),
+            "system_available_bytes": int(vm.available),
+            "system_used_bytes": int(vm.used),
+            "system_used_percent": float(vm.percent),
+        })
+    except (OSError, PermissionError, psutil.Error):
+        pass
+    try:
+        swap = psutil.swap_memory()
+        result.update({
+            "swap_total_bytes": int(swap.total),
+            "swap_used_bytes": int(swap.used),
+        })
+    except (OSError, PermissionError, psutil.Error):
+        pass
+    return result
 
 
 class ResourceSampler:

@@ -176,6 +176,7 @@ def benchmark_rendering(
                 **context, "variant": name, "target": Path(ply_path).name,
                 "width": width, "height": height, "warmup_frames": warmup,
                 "measured_frames": measured, **metrics, "status": "success",
+                "ply_size_bytes": Path(ply_path).stat().st_size,
             }
         except Exception as exc:
             row = {
@@ -183,6 +184,10 @@ def benchmark_rendering(
                 "width": width, "height": height, "warmup_frames": warmup,
                 "measured_frames": measured, "status": "failed",
                 "reason": f"{type(exc).__name__}: {exc}",
+                "ply_size_bytes": (
+                    Path(ply_path).stat().st_size
+                    if Path(ply_path).exists() else None
+                ),
             }
         rows.append(row)
     write_csv(output_dir / "rendering_metrics.csv", rows, RENDERING_COLUMNS)

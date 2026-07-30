@@ -45,21 +45,52 @@ def statistical_summary(values: list[float]) -> dict:
     }
 
 
+def grouped_metric_summary(
+    rows: list[dict], group_key: str, metric_keys: tuple[str, ...]
+) -> dict:
+    result = {}
+    for group in sorted({str(row.get(group_key, "")) for row in rows}):
+        group_rows = [row for row in rows if str(row.get(group_key, "")) == group]
+        result[group] = {
+            metric: statistical_summary(
+                [
+                    value
+                    for row in group_rows
+                    if (value := _number(row.get(metric))) is not None
+                ]
+            )
+            for metric in metric_keys
+        }
+    return result
+
+
 def aggregate_results(input_root: str | Path, output_dir: str | Path) -> dict:
     input_root, output_dir = Path(input_root), Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    def is_aggregate_artifact(path: Path) -> bool:
+        return (
+            output_dir in path.parents
+            or any(parent.name == "report" for parent in path.parents)
+        )
+
     aggregated = {}
     for filename, columns in TABLES.items():
         rows = []
         for path in input_root.rglob(filename):
-            if output_dir in path.parents:
+            if is_aggregate_artifact(path):
                 continue
             rows.extend(read_csv(path))
         write_csv(output_dir / filename, rows, columns)
         aggregated[filename] = len(rows)
+    reconstruction_rows = read_csv(output_dir / "reconstruction_metrics.csv")
+    rendering_rows = read_csv(output_dir / "rendering_metrics.csv")
+    editing_rows = read_csv(output_dir / "editing_metrics.csv")
+    mood_rows = read_csv(output_dir / "mood_metrics.csv")
+    stage_rows = read_csv(output_dir / "stage_timings.csv")
     summaries = {
         "stage_wall_seconds": statistical_summary([
-            value for row in read_csv(output_dir / "stage_timings.csv")
+            value for row in stage_rows
             if (value := _number(row.get("wall_seconds"))) is not None
         ]),
         "layer_final_gaussians": statistical_summary([
@@ -67,26 +98,87 @@ def aggregate_results(input_root: str | Path, output_dir: str | Path) -> dict:
             if (value := _number(row.get("final_gaussians"))) is not None
         ]),
         "reconstruction_psnr_db": statistical_summary([
-            value for row in read_csv(output_dir / "reconstruction_metrics.csv")
+            value for row in reconstruction_rows
             if (value := _number(row.get("psnr_db"))) is not None
         ]),
         "rendering_fps": statistical_summary([
-            value for row in read_csv(output_dir / "rendering_metrics.csv")
+            value for row in rendering_rows
             if (value := _number(row.get("average_fps"))) is not None
         ]),
+        "reconstruction_by_variant": grouped_metric_summary(
+            reconstruction_rows, "variant", ("psnr_db", "ssim", "lpips", "mae")
+        ),
+        "rendering_by_variant": grouped_metric_summary(
+            rendering_rows,
+            "variant",
+            (
+                "average_fps", "mean_ms", "p95_ms", "gaussian_count",
+                "ply_size_bytes",
+            ),
+        ),
+        "editing_layered": {
+            metric: statistical_summary(
+                [
+                    value
+                    for row in editing_rows
+                    if row.get("variant") == "layered"
+                    and (value := _number(row.get(metric))) is not None
+                ]
+            )
+            for metric in (
+                "edit_leakage_ratio",
+                "edit_locality_score",
+                "outside_changed_percent",
+                "creation_seconds",
+            )
+        },
+        "mood_topology": {
+            metric: statistical_summary(
+                [
+                    value
+                    for row in mood_rows
+                    if (value := _number(row.get(metric))) is not None
+                ]
+            )
+            for metric in (
+                "gaussian_count_difference",
+                "position_max_abs",
+                "scale_max_abs",
+                "rotation_max_abs",
+                "opacity_max_abs",
+                "nonappearance_changed_percent",
+                "analytic_fit_seconds",
+                "circular_seam_mae",
+            )
+        },
+        "pipeline_stage_by_name": grouped_metric_summary(
+            stage_rows, "stage", ("wall_seconds", "peak_sampled_rss_bytes")
+        ),
+        "scope_warning": (
+            "The legacy reconstruction_psnr_db and rendering_fps summaries mix "
+            "variants and are diagnostic only. Use the by-variant summaries for claims."
+        ),
     }
     summaries["paired_monolithic_vs_layered"] = paired_variant_summary(
         read_csv(output_dir / "reconstruction_metrics.csv"), "psnr_db"
     )
     run_summaries = []
     for path in input_root.rglob("run_summary.json"):
-        if output_dir in path.parents:
+        if is_aggregate_artifact(path):
             continue
         try:
             run_summaries.append(json.loads(path.read_text(encoding="utf-8")))
         except (OSError, json.JSONDecodeError):
             pass
     failures = [row for row in run_summaries if row.get("status") not in ("success", "partial_success")]
+    summaries["run_resources"] = {
+        "final_gaussian_count": statistical_summary(
+            [_number(row.get("final_gaussian_count")) for row in run_summaries]
+        ),
+        "peak_process_rss_bytes": statistical_summary(
+            [_number(row.get("peak_process_rss_bytes")) for row in run_summaries]
+        ),
+    }
     status = {
         "scene_runs": len(run_summaries),
         "successful": sum(row.get("status") == "success" for row in run_summaries),
@@ -172,33 +264,12 @@ def generate_plots(output_dir: str | Path) -> list[str]:
     edits = read_csv(output_dir / "editing_metrics.csv")
     moods = read_csv(output_dir / "mood_metrics.csv")
     resources = read_csv(output_dir / "resource_samples.csv")
-    layer_scene_rows = []
-    for scene in sorted({row.get("scene", "") for row in layers}):
-        scene_layers = [row for row in layers if row.get("scene", "") == scene]
-        times = [_number(row.get("training_time_seconds")) for row in scene_layers]
-        layer_scene_rows.append({
-            "layer_count": len(scene_layers),
-            "training_time_seconds": (
-                sum(value for value in times if value is not None)
-                if any(value is not None for value in times) else None
-            ),
-        })
     try:
         aggregate_payload = json.loads((output_dir / "aggregated_summary.json").read_text())
         robustness = aggregate_payload.get("robustness", {})
     except (OSError, json.JSONDecodeError):
         aggregate_payload = {}
         robustness = {}
-    memory_gaussian_rows = [
-        {
-            "final_gaussians": row.get("final_gaussian_count"),
-            "peak_memory_gib": (
-                float(row["peak_process_rss_bytes"]) / 1024 ** 3
-                if row.get("peak_process_rss_bytes") else None
-            ),
-        }
-        for row in aggregate_payload.get("runs", [])
-    ]
     status_rows = [
         {"status": label, "count": robustness.get(key)}
         for label, key in (("Success", "successful"), ("Partial", "partial"), ("Failed", "failed"))
@@ -223,20 +294,29 @@ def generate_plots(output_dir: str | Path) -> list[str]:
             "generation_of_layer_training_data", "object_detection_and_segmentation",
         }
     ]
+    edit_plot_rows = [
+        {
+            **row,
+            "scene_target": (
+                f"{row.get('scene', '')}:{row.get('target_type', '')}"
+                f"_{row.get('target_id', '')}"
+            ),
+        }
+        for row in edits
+    ]
+    monolithic_layered = [
+        row for row in reconstruction
+        if row.get("variant") in {"layered", "monolithic"}
+    ]
     definitions = [
         ("total_runtime_by_scene", "Total runtime by scene", "Scene", "Seconds", total_runtime_rows, "scene", "wall_seconds", "bar"),
         ("runtime_breakdown_by_stage", "Runtime breakdown by stage", "Stage", "Seconds", breakdown_stages, "stage", "wall_seconds", "bar"),
         ("peak_memory_by_scene", "Peak process memory by scene", "Scene", "GiB", resources, "scene", "process_rss_bytes", "max_gib"),
         ("training_time_vs_final_gaussians", "Training time vs final Gaussian count", "Final Gaussians", "Seconds", layers, "final_gaussians", "training_time_seconds", "scatter"),
-        ("memory_vs_final_gaussians", "Memory vs final Gaussian count", "Final Gaussians", "Peak GiB", memory_gaussian_rows, "final_gaussians", "peak_memory_gib", "scatter"),
-        ("training_time_vs_layers", "Training time vs number of layers", "Number of layers", "Seconds", layer_scene_rows, "layer_count", "training_time_seconds", "scatter"),
-        ("mask_coverage_vs_projected_points", "Mask coverage vs projected 3D points", "Coverage (%)", "Points", layers, "mask_coverage_percent", "projected_3d_points", "scatter"),
-        ("projected_points_vs_final_gaussians", "Projected points vs final Gaussians", "Projected points", "Final Gaussians", layers, "projected_3d_points", "final_gaussians", "scatter"),
-        ("per_layer_training_time_distribution", "Per-layer training-time distribution", "Layers", "Seconds", layers, "layer_index", "training_time_seconds", "hist"),
         ("reconstruction_quality_comparison", "Reconstruction quality comparison", "Variant", "Mean PSNR (dB)", reconstruction, "variant", "psnr_db", "mean_bar"),
-        ("monolithic_vs_layered", "Monolithic vs layered comparison", "Variant", "Mean PSNR (dB)", reconstruction, "variant", "psnr_db", "mean_bar"),
+        ("monolithic_vs_layered", "Monolithic vs layered comparison", "Variant", "Mean PSNR (dB)", monolithic_layered, "variant", "psnr_db", "mean_bar"),
         ("rendering_fps_vs_gaussians", "Rendering FPS vs Gaussian count", "Gaussians", "FPS", renders, "gaussian_count", "average_fps", "scatter"),
-        ("edit_leakage_by_target", "Edit leakage by target", "Target", "Mean leakage ratio", edits, "target_id", "edit_leakage_ratio", "mean_bar"),
+        ("edit_leakage_by_target", "Edit leakage by scene and target", "Scene:target", "Leakage ratio", edit_plot_rows, "scene_target", "edit_leakage_ratio", "mean_bar"),
         ("day_night_property_differences", "Day/night non-appearance differences", "Mood", "Changed Gaussians (%)", moods, "mood_variant", "nonappearance_changed_percent", "mean_bar"),
         ("success_failure_summary", "Success/failure summary", "Status", "Runs", status_rows, "status", "count", "bar"),
     ]
@@ -293,16 +373,102 @@ def generate_report(output_dir: str | Path, summary: dict | None = None) -> Path
         path = output_dir / "aggregated_summary.json"
         summary = json.loads(path.read_text()) if path.exists() else {}
     robustness = summary.get("robustness", {})
+    statistics = summary.get("statistics", {})
+
+    def mean(group: dict, metric: str):
+        value = ((group or {}).get(metric) or {}).get("mean")
+        return float(value) if value is not None else None
+
+    def median(group: dict, metric: str):
+        value = ((group or {}).get(metric) or {}).get("median")
+        return float(value) if value is not None else None
+
+    def formatted(value, digits=3, scale=1.0, suffix=""):
+        return "n/a" if value is None else f"{value / scale:.{digits}f}{suffix}"
+
+    reconstruction = statistics.get("reconstruction_by_variant", {})
+    rendering = statistics.get("rendering_by_variant", {})
+    editing = statistics.get("editing_layered", {})
+    mood = statistics.get("mood_topology", {})
+    stages = statistics.get("pipeline_stage_by_name", {})
+    paired = statistics.get("paired_monolithic_vs_layered", {})
+    quality_rows = []
+    for variant in ("layered", "refined", "monolithic"):
+        if variant not in reconstruction:
+            continue
+        quality_rows.append(
+            f"| {variant} | "
+            f"{formatted(mean(reconstruction[variant], 'psnr_db'), 2)} | "
+            f"{formatted(mean(reconstruction[variant], 'ssim'), 3)} | "
+            f"{formatted(mean(reconstruction[variant], 'lpips'), 3)} | "
+            f"{formatted(mean(reconstruction[variant], 'mae'), 4)} |"
+        )
+    rendering_rows = []
+    for variant in ("layered", "refined", "monolithic", "night"):
+        if variant not in rendering:
+            continue
+        rendering_rows.append(
+            f"| {variant} | "
+            f"{formatted(mean(rendering[variant], 'average_fps'), 3)} | "
+            f"{formatted(mean(rendering[variant], 'mean_ms'), 1)} | "
+            f"{formatted(mean(rendering[variant], 'p95_ms'), 1)} | "
+            f"{formatted(mean(rendering[variant], 'gaussian_count'), 3, 1e6, ' M')} | "
+            f"{formatted(mean(rendering[variant], 'ply_size_bytes'), 3, 1024 ** 3, ' GiB')} |"
+        )
+    difference = ((paired.get("difference_summary") or {}).get("mean"))
     lines = [
         "# ObjSplat Benchmark Report", "",
-        "## Run summary", "",
+        "## Run status", "",
         f"- Scene runs: {robustness.get('scene_runs', 0)}",
         f"- Successful: {robustness.get('successful', 0)}",
         f"- Partial: {robustness.get('partial', 0)}",
         f"- Failed: {robustness.get('failed', 0)}",
-        "", "## Statistical summaries", "",
-        "```json", json.dumps(summary.get("statistics", {}), indent=2), "```", "",
-        "## Scientific interpretation", "",
+        "",
+        "## Reconstruction fidelity", "",
+        "| Variant | PSNR ↑ | SSIM ↑ | LPIPS ↓ | MAE ↓ |",
+        "|---|---:|---:|---:|---:|",
+        *quality_rows,
+        "",
+        f"Mean paired monolithic − layered PSNR: "
+        f"{formatted(difference, 3, suffix=' dB')}.",
+        "",
+        "## Computational efficiency", "",
+        f"- Complete pipeline: "
+        f"{formatted(mean(stages.get('complete_end_to_end', {}), 'wall_seconds'), 1, 60, ' min')}",
+        f"- Layer training: "
+        f"{formatted(mean(stages.get('all_layer_training', {}), 'wall_seconds'), 1, 60, ' min')}",
+        f"- Monolithic training: "
+        f"{formatted(mean(stages.get('monolithic_baseline', {}), 'wall_seconds'), 1, 60, ' min')}",
+        f"- Peak process memory: "
+        f"{formatted(mean(statistics.get('run_resources', {}), 'peak_process_rss_bytes'), 2, 1024 ** 3, ' GiB')}",
+        "",
+        "| Variant | FPS ↑ | Mean ms ↓ | p95 ms ↓ | Gaussian count | PLY size |",
+        "|---|---:|---:|---:|---:|---:|",
+        *rendering_rows,
+        "",
+        "## Object-edit locality", "",
+        f"- Leakage: mean "
+        f"{formatted(mean(editing, 'edit_leakage_ratio'), 5)}, median "
+        f"{formatted(median(editing, 'edit_leakage_ratio'), 5)}",
+        f"- Locality: mean "
+        f"{formatted(mean(editing, 'edit_locality_score'), 5)}, median "
+        f"{formatted(median(editing, 'edit_locality_score'), 5)}",
+        f"- Outside changed pixels: "
+        f"{formatted(mean(editing, 'outside_changed_percent'), 2, suffix='%')} mean",
+        f"- Edit creation time: "
+        f"{formatted(mean(editing, 'creation_seconds'), 2, suffix=' s')} mean",
+        "",
+        "## Day/night topology", "",
+        f"- Non-appearance properties changed: "
+        f"{formatted(mean(mood, 'nonappearance_changed_percent'), 5, suffix='%')}",
+        f"- Maximum position difference: "
+        f"{formatted(mean(mood, 'position_max_abs'), 6)}",
+        f"- Analytic fitting time: "
+        f"{formatted(mean(mood, 'analytic_fit_seconds'), 2, suffix=' s')}",
+        f"- Circular seam MAE: "
+        f"{formatted(mean(mood, 'circular_seam_mae'), 5)}",
+        "",
+        "## Validity and limitations", "",
         "Held-out perspective views derived from the input ERP measure panorama reconstruction fidelity. "
         "They do not constitute independent viewpoints and must not be interpreted as true multi-view "
         "geometric or novel-view accuracy.",
@@ -315,13 +481,22 @@ def generate_report(output_dir: str | Path, summary: dict | None = None) -> Path
         "Instance-level editing is reported only when the Gaussian PLY retains an integer `label` property. "
         "Otherwise the result is unavailable; shared semantic layers support layer-level removal only.",
         "",
-        "Missing optional dependencies and technically unavailable metrics remain blank/null and are not "
-        "imputed. Partial and failed runs retain completed stages and identify the failed stage.",
-        "", "## Plots", "",
+        "Missing optional metrics are reported as `n/a`, never imputed. Raw CSV and JSON files remain "
+        "available for audit but are intentionally omitted from this concise report.",
+        "", "## Scientific plots", "",
     ]
-    for png in sorted((output_dir / "plots").glob("*.png")):
-        lines.append(f"![{png.stem}](plots/{png.name})")
-        lines.append("")
+    important_plots = (
+        "monolithic_vs_layered",
+        "total_runtime_by_scene",
+        "peak_memory_by_scene",
+        "rendering_fps_vs_gaussians",
+        "edit_leakage_by_target",
+        "day_night_property_differences",
+    )
+    for stem in important_plots:
+        png = output_dir / "plots" / f"{stem}.png"
+        if png.exists():
+            lines.extend((f"![{stem}](plots/{png.name})", ""))
     report = output_dir / "report.md"
     report.write_text("\n".join(lines), encoding="utf-8")
     return report

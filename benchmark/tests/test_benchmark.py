@@ -10,6 +10,7 @@ import numpy as np
 from plyfile import PlyData, PlyElement
 
 from benchmark.config import load_config, validate_config
+from benchmark.editing_evaluation import resolve_layer_selectors
 from benchmark.instrumentation import BenchmarkRecorder
 from benchmark.input_preparation import prepare_panorama
 from benchmark.instrumentation.resources import ResourceSampler
@@ -28,6 +29,7 @@ from benchmark.run_benchmark import (
     expand_scenes,
 )
 from mps_splat_backend import _balanced_camera_indices
+from LayerPano import adaptive_iteration_count, allocate_gaussian_budgets
 
 
 def tiny_vertex(count=2):
@@ -148,6 +150,49 @@ class ConfigAndReportTests(unittest.TestCase):
             }))
             config = load_config(path)
             self.assertEqual(config["random_seed"], 42)
+        with self.assertRaisesRegex(ValueError, "selected_layers"):
+            validate_config({
+                "experiment_name": "test",
+                "scenes": [{"scene_root": "scene"}],
+                "selected_layers": ["unknown"],
+            })
+
+    def test_global_budget_and_adaptive_iterations(self):
+        budgets = allocate_gaussian_budgets(
+            {0: 4_000_000, 1: 1_000_000, 2: 40_000},
+            total_budget=2_000_000,
+            minimum_per_layer=20_000,
+        )
+        self.assertEqual(sum(budgets.values()), 2_000_000)
+        self.assertGreater(budgets[0], budgets[1])
+        self.assertGreater(budgets[2] / 40_000, budgets[0] / 4_000_000)
+        self.assertLess(
+            adaptive_iteration_count(800, 40_000),
+            adaptive_iteration_count(800, 1_000_000),
+        )
+
+    def test_semantic_layer_size_selectors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "traindata").mkdir()
+            (root / "scene").mkdir()
+            (root / "traindata" / "layer_instances.json").write_text(json.dumps({
+                "background_layer_idx": 3,
+                "layer_groups": [
+                    {"layer_idx": 0}, {"layer_idx": 1},
+                    {"layer_idx": 2}, {"layer_idx": 3},
+                ],
+            }))
+            for index, count in enumerate((2, 7, 4, 10)):
+                PlyData([
+                    PlyElement.describe(tiny_vertex(count), "vertex")
+                ]).write(root / "scene" / f"gsplat_layer{index}.ply")
+            self.assertEqual(
+                resolve_layer_selectors(
+                    root, ["smallest", "median", "largest"]
+                ),
+                [0, 2, 1],
+            )
 
     def test_input_preparation_converts_and_records_source(self):
         from PIL import Image
@@ -247,6 +292,17 @@ class ConfigAndReportTests(unittest.TestCase):
             self.assertTrue((output / "report.md").exists())
             self.assertTrue((output / "plots" / "total_runtime_by_scene.png").exists())
             self.assertEqual(generate_report(output).name, "report.md")
+            report = (output / "report.md").read_text()
+            self.assertIn("Reconstruction fidelity", report)
+            self.assertNotIn("All diagnostic summaries", report)
+            stale_report = root / "experiment" / "report"
+            stale_report.mkdir()
+            (stale_report / "run_summary.json").write_text(
+                json.dumps({"status": "success"})
+            )
+            second_output = root / "second_report"
+            repeated = aggregate_results(root / "experiment", second_output)
+            self.assertEqual(repeated["robustness"]["scene_runs"], 1)
 
 
 if __name__ == "__main__":

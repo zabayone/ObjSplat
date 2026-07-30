@@ -24,7 +24,9 @@ def _read_points(path: Path):
     return points, colors, labels
 
 
-def build_traindata(scene_root: Path, image_size: int) -> dict:
+def build_traindata(
+    scene_root: Path, image_size: int, max_points: int = 0, seed: int = 42
+) -> dict:
     clouds = [_read_points(path) for path in sorted((scene_root / "traindata").glob("layer*/pcd_rgb_layer*.ply"))]
     if not clouds:
         raise RuntimeError("No layer point clouds found")
@@ -43,12 +45,21 @@ def build_traindata(scene_root: Path, image_size: int) -> dict:
         frames.append({"image": image, "transform_matrix": np.load(pose_path)})
     if not frames:
         raise RuntimeError("No monolithic training frames found")
+    points = np.concatenate([x[0] for x in clouds])
+    colors = np.concatenate([x[1] for x in clouds])
+    labels = np.concatenate([x[2] for x in clouds])
+    if int(max_points or 0) > 0 and len(points) > int(max_points):
+        rng = np.random.default_rng(int(seed))
+        selected = np.sort(
+            rng.choice(len(points), size=int(max_points), replace=False)
+        )
+        points, colors, labels = points[selected], colors[selected], labels[selected]
     return {
         "fov": 90, "W": frames[0]["image"].width, "H": frames[0]["image"].height,
-        "pcd_points": np.concatenate([x[0] for x in clouds]),
-        "pcd_colors": np.concatenate([x[1] for x in clouds]),
-        "pcd_labels": np.concatenate([x[2] for x in clouds]),
-        "pcd_masks": np.ones((sum(len(x[0]) for x in clouds), 3), dtype=np.float32),
+        "pcd_points": points,
+        "pcd_colors": colors,
+        "pcd_labels": labels,
+        "pcd_masks": np.ones((len(points), 3), dtype=np.float32),
         "frames": frames,
     }
 
@@ -61,11 +72,15 @@ def main() -> None:
     parser.add_argument("--image_size", type=int, default=640)
     parser.add_argument("--rasterizer", default="cpp", choices=["cpp", "python"])
     parser.add_argument("--adaptive", action="store_true")
+    parser.add_argument("--max_points", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-    data = build_traindata(Path(args.scene_root), args.image_size)
+    data = build_traindata(
+        Path(args.scene_root), args.image_size, args.max_points, args.seed
+    )
     train_with_splat_apple(
         data, args.output, num_iterations=args.iterations, rasterizer=args.rasterizer,
-        adaptive=args.adaptive, downsample_ratio=1.0, max_points=0,
+        adaptive=args.adaptive, downsample_ratio=1.0, max_points=args.max_points,
         training_profile="layer_instances",
     )
 

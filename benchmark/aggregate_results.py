@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -17,7 +16,16 @@ def main() -> None:
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
-    print(json.dumps(aggregate_results(args.input, args.output), indent=2))
+    result = aggregate_results(args.input, args.output)
+    status = result.get("robustness", {})
+    print(
+        "Aggregated "
+        f"{status.get('scene_runs', 0)} scene runs: "
+        f"{status.get('successful', 0)} successful, "
+        f"{status.get('partial', 0)} partial, "
+        f"{status.get('failed', 0)} failed."
+    )
+    print(f"Scientific report: {Path(args.output).resolve() / 'report.md'}")
 
 
 if __name__ == "__main__":

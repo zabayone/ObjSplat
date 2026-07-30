@@ -119,9 +119,73 @@ def _is_nonempty_training_image(image, min_nonzero_ratio: float = 1e-5) -> bool:
     return float(np.count_nonzero(arr)) / float(arr.size) > float(min_nonzero_ratio)
 
 
+def _ply_vertex_count(path: str) -> int:
+    """Read a PLY vertex count without loading its potentially multi-GB payload."""
+    try:
+        with open(path, "rb") as handle:
+            for _ in range(256):
+                line = handle.readline()
+                if not line:
+                    break
+                if line.startswith(b"element vertex "):
+                    return int(line.split()[-1])
+                if line.strip() == b"end_header":
+                    break
+    except (OSError, ValueError):
+        pass
+    return 0
+
+
+def allocate_gaussian_budgets(
+    point_counts: Dict[int, int],
+    total_budget: int,
+    minimum_per_layer: int = 10_000,
+) -> Dict[int, int]:
+    """Allocate a global Gaussian budget while retaining small semantic layers.
+
+    Square-root weighting gives small layers more representation per input point
+    than large, low-frequency surfaces while preserving a strict global cap.
+    """
+    counts = {int(k): max(1, int(v)) for k, v in point_counts.items()}
+    total_budget = int(total_budget or 0)
+    if not counts or total_budget <= 0:
+        return {}
+    layer_count = len(counts)
+    floor = min(max(1, int(minimum_per_layer)), max(1, total_budget // layer_count))
+    budgets = {idx: floor for idx in counts}
+    remaining = total_budget - floor * layer_count
+    if remaining <= 0:
+        return budgets
+    weights = {idx: math.sqrt(value) for idx, value in counts.items()}
+    weight_sum = sum(weights.values())
+    fractional = {}
+    for idx, weight in weights.items():
+        exact = remaining * weight / max(weight_sum, 1e-12)
+        whole = int(math.floor(exact))
+        budgets[idx] += whole
+        fractional[idx] = exact - whole
+    leftover = total_budget - sum(budgets.values())
+    for idx in sorted(fractional, key=fractional.get, reverse=True)[:leftover]:
+        budgets[idx] += 1
+    return budgets
+
+
+def adaptive_iteration_count(
+    base_iterations: int,
+    point_count: int,
+    reference_points: int = 500_000,
+    minimum_scale: float = 0.5,
+    maximum_scale: float = 1.25,
+) -> int:
+    """Scale training mildly with layer size, avoiding overtraining tiny layers."""
+    ratio = max(1, int(point_count)) / max(1, int(reference_points))
+    scale = min(float(maximum_scale), max(float(minimum_scale), ratio ** 0.25))
+    return max(1, int(round(int(base_iterations) * scale)))
+
+
 
 class LayerPano:
-    def __init__(self, save_dir=None, backend="legacy", mps_rasterizer="cpp", quality="standard", max_points=None, downsample_ratio=0.1, training_image_size=None, layer_iterations=800, background_iterations=1000, sky_iterations=500, disable_transfer=False, no_adaptive=False, repulsion_weight=1e-4, mean_lr_scale=1.0, mode="standard", early_stop_patience=None, early_stop_min_delta=0.0, lr_plateau_patience=None, lr_plateau_factor=0.5, lr_plateau_min_lr=1e-6):
+    def __init__(self, save_dir=None, backend="legacy", mps_rasterizer="cpp", quality="standard", max_points=None, downsample_ratio=0.1, training_image_size=None, layer_iterations=800, background_iterations=1000, sky_iterations=500, disable_transfer=False, no_adaptive=False, repulsion_weight=1e-4, mean_lr_scale=1.0, mode="standard", early_stop_patience=None, early_stop_min_delta=0.0, lr_plateau_patience=None, lr_plateau_factor=0.5, lr_plateau_min_lr=1e-6, total_gaussian_budget=0, min_gaussians_per_layer=10_000, adaptive_iterations=False, iteration_reference_points=500_000, iteration_min_scale=0.5, iteration_max_scale=1.25):
         self.init_logger()
         self.save_dir = save_dir
         self.opt = GSParams()
@@ -146,6 +210,12 @@ class LayerPano:
         self.lr_plateau_patience = lr_plateau_patience
         self.lr_plateau_factor = lr_plateau_factor
         self.lr_plateau_min_lr = lr_plateau_min_lr
+        self.total_gaussian_budget = int(total_gaussian_budget or 0)
+        self.min_gaussians_per_layer = int(min_gaussians_per_layer)
+        self.adaptive_iterations = bool(adaptive_iterations)
+        self.iteration_reference_points = int(iteration_reference_points)
+        self.iteration_min_scale = float(iteration_min_scale)
+        self.iteration_max_scale = float(iteration_max_scale)
         
         # Device selection: CUDA > MPS > CPU
         if torch.cuda.is_available():
@@ -357,10 +427,42 @@ class LayerPano:
         }
         iter_scale = quality_iteration_scale.get(self.quality, 1.0)
 
+        point_counts = {
+            idx: _ply_vertex_count(
+                os.path.join(input_dir, f"layer{idx}", f"pcd_rgb_layer{idx}.ply")
+            )
+            for idx in layer_order
+        }
+        layer_budgets = allocate_gaussian_budgets(
+            point_counts,
+            self.total_gaussian_budget,
+            self.min_gaussians_per_layer,
+        )
+        if layer_budgets:
+            print(
+                "[pipeline] Global Gaussian budget "
+                f"{self.total_gaussian_budget:,}: "
+                + ", ".join(
+                    f"layer{idx}={layer_budgets[idx]:,}" for idx in layer_order
+                )
+            )
+
         output_paths = []
         for layer_idx in layer_order:
             layer_started = time.perf_counter()
-            self.traindata = self.load_pcd_and_perspectives(input_dir, layer_idx)
+            layer_cap = layer_budgets.get(layer_idx)
+            if self.max_points is not None and int(self.max_points) > 0:
+                layer_cap = (
+                    int(self.max_points)
+                    if layer_cap is None
+                    else min(int(self.max_points), int(layer_cap))
+                )
+            original_max_points = self.max_points
+            self.max_points = layer_cap
+            try:
+                self.traindata = self.load_pcd_and_perspectives(input_dir, layer_idx)
+            finally:
+                self.max_points = original_max_points
 
             if self.quality == "test":
                 n_iterations = 200
@@ -371,6 +473,14 @@ class LayerPano:
                     n_iterations = int(self.background_iterations * iter_scale)
                 else:
                     n_iterations = int(self.layer_iterations * iter_scale)
+            if self.adaptive_iterations:
+                n_iterations = adaptive_iteration_count(
+                    n_iterations,
+                    len(self.traindata.get("pcd_points", [])),
+                    self.iteration_reference_points,
+                    self.iteration_min_scale,
+                    self.iteration_max_scale,
+                )
 
             if self.backend == "splat-apple":
                 if not HAS_SPLAT_APPLE_BACKEND:
@@ -398,7 +508,7 @@ class LayerPano:
                         rasterizer=self.mps_rasterizer,
                         device=self.device,
                         adaptive=(not self.no_adaptive),
-                        max_points=self.max_points,
+                        max_points=layer_cap,
                         downsample_ratio=self.downsample_ratio,
                         repulsion_weight=self.repulsion_weight,
                         mean_lr_scale=self.mean_lr_scale,
@@ -674,14 +784,24 @@ class LayerPano:
         assert pcd_points.shape[0] == pcd_masks.shape[0]
         pretrain_cap = int(self.max_points) if self.max_points is not None and int(self.max_points) > 0 else None
         if pretrain_cap is not None:
-            pretrain_cap = max(pretrain_cap, 2500000)
+            # Historical per-layer caps retained at least 2.5M points to avoid
+            # accidental coverage loss. A global budget is explicit and must be
+            # honored exactly, including before the first training iteration.
+            if self.total_gaussian_budget <= 0:
+                pretrain_cap = max(pretrain_cap, 2500000)
             if len(pcd_points) > pretrain_cap:
-                ratio = len(pcd_points) // pretrain_cap + 1
-                print('Warning: PointCloud is too large {}, downsampling by ratio of {}'.format(len(pcd_points),ratio))
-                pcd_points = pcd_points[::ratio]
-                pcd_colors = pcd_colors[::ratio]
-                pcd_masks = pcd_masks[::ratio]
-                pcd_labels = pcd_labels[::ratio]
+                select = np.linspace(
+                    0, len(pcd_points) - 1,
+                    num=pretrain_cap, dtype=np.int64,
+                )
+                print(
+                    f"Warning: PointCloud is too large {len(pcd_points)}, "
+                    f"downsampling to {pretrain_cap}"
+                )
+                pcd_points = pcd_points[select]
+                pcd_colors = pcd_colors[select]
+                pcd_masks = pcd_masks[select]
+                pcd_labels = pcd_labels[select]
 
         if 0.0 < self.downsample_ratio < 1.0 and len(pcd_points) > 0:
             target = max(1, int(round(len(pcd_points) * self.downsample_ratio)))

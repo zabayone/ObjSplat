@@ -19,7 +19,7 @@ import numpy as np
 
 from benchmark.config import load_config
 from benchmark.evaluation import benchmark_rendering, evaluate_reconstruction
-from benchmark.editing_evaluation import evaluate_editing
+from benchmark.editing_evaluation import evaluate_editing, resolve_layer_selectors
 from benchmark.instrumentation import BenchmarkRecorder
 from benchmark.input_preparation import file_sha256, prepare_panorama
 from benchmark.io_utils import atomic_json
@@ -281,6 +281,9 @@ def run_scene(
             )
             recorder.summary.update(summary)
         variants = _variants(scene_root)
+        selected_layers = resolve_layer_selectors(
+            scene_root, config.get("selected_layers", [])
+        )
         if config.get("run_monolithic_baseline"):
             baseline = scene_root / "scene" / "gsplat_scene_monolithic.ply"
             baseline_cfg = config.get("monolithic", {})
@@ -291,6 +294,8 @@ def run_scene(
                 "--iterations", str(baseline_cfg.get("iterations", 1000)),
                 "--image_size", str(baseline_cfg.get("image_size", 640)),
                 "--rasterizer", str(baseline_cfg.get("rasterizer", "cpp")),
+                "--max_points", str(baseline_cfg.get("max_points", 0)),
+                "--seed", str(config.get("random_seed", 42)),
             ]
             if baseline_cfg.get("adaptive_topology"):
                 command.append("--adaptive")
@@ -310,7 +315,7 @@ def run_scene(
         if config.get("run_rendering_benchmark"):
             render_cfg = config["rendering"]
             render_variants = dict(variants)
-            for layer_index in config.get("selected_layers", []):
+            for layer_index in selected_layers:
                 layer_path = scene_root / "scene" / f"gsplat_layer{int(layer_index)}.ply"
                 if layer_path.exists():
                     render_variants[f"layer_{int(layer_index)}"] = layer_path
@@ -326,7 +331,7 @@ def run_scene(
             with recorder.stage("edit_locality_evaluation"):
                 evaluate_editing(
                     scene_root, output, context,
-                    [int(x) for x in config.get("selected_layers", [])],
+                    selected_layers,
                     [int(x) for x in config.get("selected_instances", [])],
                     width=int(render_cfg["width"]), height=int(render_cfg["height"]),
                     rasterizer=str(render_cfg.get("rasterizer", "cpp")),
@@ -351,7 +356,11 @@ def run_scene(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run reproducible ObjSplat benchmarks")
-    parser.add_argument("--config", required=True)
+    parser.add_argument(
+        "--config",
+        default=str(Path(__file__).resolve().parent / "configs" / "scientific_core.yaml"),
+        help="Benchmark config (defaults to the scientific core protocol)",
+    )
     parser.add_argument(
         "--force",
         action="store_true",

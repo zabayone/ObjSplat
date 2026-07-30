@@ -43,6 +43,7 @@ RENDERING_COLUMNS = [
     "warmup_frames", "measured_frames", "cold_start_seconds", "mean_ms",
     "median_ms", "p90_ms", "p95_ms", "average_fps", "minimum_fps",
     "gaussian_count", "megapixels_per_second", "status", "reason",
+    "ply_size_bytes",
 ]
 EDITING_COLUMNS = [
     "experiment", "scene", "run_id", "variant", "target_type", "target_id",

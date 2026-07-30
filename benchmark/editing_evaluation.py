@@ -15,6 +15,60 @@ from benchmark.rendering import MLXSceneRenderer
 from benchmark.schemas import EDITING_COLUMNS
 
 
+def resolve_layer_selectors(
+    scene_root: str | Path, selectors: list[int | str]
+) -> list[int]:
+    """Resolve numeric and size-based selectors against trained object layers."""
+    scene_root = Path(scene_root)
+    metadata_path = scene_root / "traindata" / "layer_instances.json"
+    metadata = (
+        json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata_path.exists()
+        else {}
+    )
+    groups = sorted(
+        {int(group["layer_idx"]) for group in metadata.get("layer_groups", [])}
+    )
+    excluded = {
+        int(value)
+        for value in (
+            metadata.get("background_layer_idx"),
+            metadata.get("residual_layer_idx"),
+            metadata.get("sky_layer_idx"),
+        )
+        if value is not None
+    }
+    object_layers = [index for index in groups if index not in excluded] or groups
+    sizes = {}
+    for index in object_layers:
+        path = scene_root / "scene" / f"gsplat_layer{index}.ply"
+        if path.exists():
+            sizes[index] = int(inspect_ply(path)["vertex_count"])
+    ranked = sorted(sizes, key=lambda index: (sizes[index], index))
+    resolved = []
+    for selector in selectors:
+        if isinstance(selector, int) or str(selector).lstrip("-").isdigit():
+            resolved.append(int(selector))
+            continue
+        name = str(selector).strip().lower()
+        if not ranked:
+            continue
+        if name == "smallest":
+            resolved.append(ranked[0])
+        elif name == "largest":
+            resolved.append(ranked[-1])
+        elif name == "median":
+            resolved.append(ranked[(len(ranked) - 1) // 2])
+        elif name == "all":
+            resolved.extend(ranked)
+        else:
+            raise ValueError(
+                f"Unknown layer selector {selector!r}; use an integer, "
+                "smallest, median, largest, or all"
+            )
+    return list(dict.fromkeys(resolved))
+
+
 def _first_target_frame(scene_root: Path, layer_index: int):
     frames = scene_root / "traindata" / f"layer{layer_index}" / "frames"
     for mask_path in sorted(frames.glob("mask_*.png")):

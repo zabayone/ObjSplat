@@ -334,6 +334,18 @@ def main() -> None:
     parser.add_argument("--quality", type=str, default="standard", choices=["standard", "high", "ultra", "test"])
     parser.add_argument("--max_points", type=int, default=0,
                         help="Per-layer gaussian cap; <=0 disables the cap")
+    parser.add_argument(
+        "--total_gaussian_budget",
+        type=int,
+        default=0,
+        help="Strict total budget distributed across all layers; <=0 disables it",
+    )
+    parser.add_argument(
+        "--min_gaussians_per_layer",
+        type=int,
+        default=10000,
+        help="Minimum allocation used with --total_gaussian_budget",
+    )
     parser.add_argument("--downsample_ratio", type=float, default=1.0)
     parser.add_argument(
         "--training_image_size",
@@ -344,6 +356,14 @@ def main() -> None:
     parser.add_argument("--layer_iterations", type=int, default=800)
     parser.add_argument("--background_iterations", type=int, default=1000)
     parser.add_argument("--sky_iterations", type=int, default=500)
+    parser.add_argument(
+        "--adaptive_iterations",
+        action="store_true",
+        help="Scale iterations mildly by per-layer point count",
+    )
+    parser.add_argument("--iteration_reference_points", type=int, default=500000)
+    parser.add_argument("--iteration_min_scale", type=float, default=0.5)
+    parser.add_argument("--iteration_max_scale", type=float, default=1.25)
     parser.add_argument("--repulsion_weight", type=float, default=1e-4)
     parser.add_argument("--mean_lr_scale", type=float, default=0.2)
     parser.add_argument(
@@ -499,6 +519,19 @@ def main() -> None:
     parser.add_argument("--equirect_kernel_size", type=int, default=7)
 
     args = parser.parse_args()
+    if args.total_gaussian_budget < 0:
+        raise ValueError("--total_gaussian_budget must be >= 0")
+    if args.min_gaussians_per_layer <= 0:
+        raise ValueError("--min_gaussians_per_layer must be > 0")
+    if not (
+        0 < args.iteration_min_scale
+        <= args.iteration_max_scale
+    ):
+        raise ValueError(
+            "Iteration scales must satisfy 0 < minimum <= maximum"
+        )
+    if args.iteration_reference_points <= 0:
+        raise ValueError("--iteration_reference_points must be > 0")
     _seed_everything(args.seed)
 
     mood_names = [
@@ -767,6 +800,12 @@ def main() -> None:
         lr_plateau_patience=(args.lr_plateau_patience or None),
         lr_plateau_factor=args.lr_plateau_factor,
         lr_plateau_min_lr=args.lr_plateau_min_lr,
+        total_gaussian_budget=args.total_gaussian_budget,
+        min_gaussians_per_layer=args.min_gaussians_per_layer,
+        adaptive_iterations=args.adaptive_iterations,
+        iteration_reference_points=args.iteration_reference_points,
+        iteration_min_scale=args.iteration_min_scale,
+        iteration_max_scale=args.iteration_max_scale,
         mode="layer_instances",
     )
 

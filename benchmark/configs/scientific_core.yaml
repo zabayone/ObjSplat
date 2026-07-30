@@ -1,0 +1,139 @@
+experiment_name: scientific_core
+output_root: benchmark_results
+python_executable: /opt/anaconda3/envs/layerpano3d/bin/python
+
+# Default thesis protocol: enough scene diversity for paired conclusions while
+# keeping every expensive option explicit and reproducible.
+input_preprocessing:
+  target_width: 4096
+  require_equirectangular_2_to_1: true
+
+scenes:
+  - name: indoor_1
+    scene_root: benchmark_work/scientific_core/indoor_1
+    input_panorama: benchmark/evaluation/indoor_1.jpg
+    pipeline_args: &indoor
+      [--grounding_prompts, "wall . floor . ceiling . door . window . chair . table . sofa . bed . cabinet . shelf . lamp . plant . person",
+       --sky_segmentation_backend, grounding_sam]
+  - name: indoor_2
+    scene_root: benchmark_work/scientific_core/indoor_2
+    input_panorama: benchmark/evaluation/indoor_2.jpg
+    pipeline_args: *indoor
+  - name: indoor_3
+    scene_root: benchmark_work/scientific_core/indoor_3
+    input_panorama: benchmark/evaluation/indoor_3.jpg
+    pipeline_args: *indoor
+  - name: outdoor_1
+    scene_root: benchmark_work/scientific_core/outdoor_1
+    input_panorama: benchmark/evaluation/outdoor_1.jpg
+    pipeline_args: &outdoor
+      [--grounding_prompts, "sky . road . pavement . grass . tree . trees . bush . shrub . plant . vegetation . foliage . branches . building . house . fence . pole . person . car",
+       --sky_segmentation_backend, hybrid, --require_sky_layer,
+       --retexture_night_sky, --build_night_mood]
+  - name: outdoor_2
+    scene_root: benchmark_work/scientific_core/outdoor_2
+    input_panorama: benchmark/evaluation/outdoor_2.jpg
+    pipeline_args: *outdoor
+  - name: outdoor_3
+    scene_root: benchmark_work/scientific_core/outdoor_3
+    input_panorama: benchmark/evaluation/outdoor_3.jpg
+    pipeline_args: *outdoor
+
+rerun_segmentation: true
+retrain: true
+reuse_existing_outputs: true
+reuse_requires_scene_artifacts: true
+run_monolithic_baseline: true
+run_quality_evaluation: true
+run_rendering_benchmark: true
+run_edit_locality: true
+run_mood_evaluation: true
+fail_fast: false
+random_seed: 42
+# Five-second sampling is sufficient for multi-minute stages and avoids tens of
+# thousands of low-value rows in the scientific report dataset.
+resource_sampling_interval: 5.0
+
+splits:
+  training_fraction: 0.8
+  evaluation_fraction: 0.2
+
+quality_evaluation:
+  max_side: 512
+
+rendering:
+  width: 512
+  height: 512
+  warmup_frames: 5
+  measured_frames: 30
+  rasterizer: cpp
+
+# Evaluate small, representative, and large semantic objects rather than the
+# arbitrary layer index zero.
+selected_layers: [smallest, median, largest]
+selected_instances: []
+
+# Equal representation cap makes storage, speed, and quality comparisons more
+# interpretable than the previous one-Gaussian-per-ERP-pixel setup.
+monolithic:
+  iterations: 1000
+  image_size: 640
+  rasterizer: cpp
+  adaptive_topology: true
+  max_points: 4000000
+
+pipeline_args:
+  - --device
+  - mps
+  - --depth_scale
+  - "200"
+  - --n_views
+  - "12"
+  - --phi_bands
+  - "80,67.5,45,0,-45,-67.5,-80"
+  - --perspective_size
+  - "1024"
+  - --use_grounding_dino
+  - --grounding_box_threshold
+  - "0.18"
+  - --grounding_text_threshold
+  - "0.15"
+  - --grounding_mask_min_area
+  - "500"
+  - --grounding_infer_max_side
+  - "1536"
+  - --aggregate_by_label
+  - --min_frame_area
+  - "1500"
+  - --min_frames
+  - "3"
+  - --min_total_pixels
+  - "10000"
+  - --min_points_3d
+  - "1000"
+  - --quality
+  - standard
+  - --mps_rasterizer
+  - cpp
+  - --total_gaussian_budget
+  - "4000000"
+  - --min_gaussians_per_layer
+  - "20000"
+  - --adaptive_topology
+  - --adaptive_iterations
+  - --training_image_size
+  - "640"
+  - --layer_iterations
+  - "800"
+  - --background_iterations
+  - "1000"
+  - --sky_iterations
+  - "500"
+  - --early_stop_patience
+  - "80"
+  - --early_stop_min_delta
+  - "0.00001"
+  - --lr_plateau_patience
+  - "40"
+  - --global_refine_iters
+  - "100"

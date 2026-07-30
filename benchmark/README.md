@@ -6,6 +6,19 @@ tables, resource traces, PNG/PDF thesis plots, and a Markdown report.
 
 ## Quick commands
 
+Run the default scientifically scoped six-scene protocol:
+
+```bash
+/opt/anaconda3/envs/layerpano3d/bin/python benchmark/run_benchmark.py
+```
+
+This uses `benchmark/configs/scientific_core.yaml`: a deterministic 80/20
+held-out split, a matched monolithic baseline, a four-million-Gaussian cap,
+adaptive layer iterations, short global refinement, full-scene rendering, and
+small/median/large object-removal targets. It is intentionally expensive.
+`lpips` is declared in `requirements.txt`; if it is absent from an older
+environment, the report marks LPIPS as `n/a` instead of inventing a value.
+
 Run the inexpensive existing-output smoke test:
 
 ```bash
@@ -90,9 +103,10 @@ images/                   evaluation evidence
 edited_representations/   optional no-retraining edit PLYs
 ```
 
-The experiment `report/` directory contains aggregated versions, a JSON
-statistical summary, 15 plot types in PNG and PDF, and `report.md`. A plot with
-missing optional inputs is deliberately rendered as “Metric unavailable”.
+The experiment `report/` directory contains aggregated raw tables, a complete
+JSON audit summary, the scientifically relevant plots in PNG/PDF, and a concise
+`report.md`. The Markdown report intentionally omits diagnostic correlations
+and mixed-variant aggregates. Missing optional values are shown as `n/a`.
 
 ## Configuration
 
@@ -110,7 +124,8 @@ Main switches:
 - deterministic `splits`;
 - rendering resolution, warm-up frames, and measured frames;
 - explicit baseline training budget;
-- selected layer and instance edit targets;
+- selected layer and instance edit targets. Layer targets accept numeric
+  indices or `smallest`, `median`, `largest`, and `all`;
 - arbitrary `pipeline_args`.
 
 An `ablations` list creates named experiment variants using configuration, not
@@ -128,6 +143,8 @@ to existing CLI flags:
 - aggregated versus separate instances: include/omit `--aggregate_by_label`;
 - filled versus unassigned background: `--fill_unassigned_layers`;
 - adaptive topology: `--adaptive_topology`;
+- strict cross-layer representation cap: `--total_gaussian_budget`;
+- size-aware iteration scheduling: `--adaptive_iterations`;
 - image size and object/background/sky iteration counts;
 - `--min_points_3d`;
 - `--global_refine_iters`;
