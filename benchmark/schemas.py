@@ -62,3 +62,25 @@ MOOD_COLUMNS = [
     "analytic_fit_seconds", "refinement_seconds", "mood_ply_size_bytes",
     "target_erp_psnr_db", "target_erp_ssim", "circular_seam_mae", "status", "reason",
 ]
+
+COMPARISON_COLUMNS = [
+    "experiment", "scene", "base_scene", "run_id", "quality", "variant",
+    "psnr_db", "ssim", "lpips", "mae", "held_out_views",
+    "training_time_seconds", "peak_training_rss_bytes", "gaussian_count",
+    "ply_size_bytes", "cold_start_seconds", "mean_ms", "median_ms",
+    "p95_ms", "average_fps", "megapixels_per_second", "training_layer_count",
+    "coverage_3d", "status", "reason",
+    "downsample_ratio",
+]
+
+QUALITY_SCALING_COLUMNS = [
+    "experiment", "base_scene", "quality", "downsample_ratio",
+    "layered_training_time_seconds", "monolithic_training_time_seconds",
+    "layered_peak_training_rss_bytes", "monolithic_peak_training_rss_bytes",
+    "layered_speedup_percent", "layered_peak_memory_reduction_percent",
+    "layered_time_change_vs_standard_percent",
+    "monolithic_time_change_vs_standard_percent",
+    "layered_memory_change_vs_standard_percent",
+    "monolithic_memory_change_vs_standard_percent",
+    "baseline_quality", "status", "reason",
+]

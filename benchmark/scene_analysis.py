@@ -193,10 +193,10 @@ def analyse_segmentation(
             background_mask = np.asarray(Image.open(path).convert("L")) >= 128
     summary = {
         "intrinsic_not_accuracy": True,
-        "total_coverage_percent": float(coverage.mean() * 100),
-        "unassigned_percent": float(unassigned.mean() * 100),
+        "total_coverage_percent": float(coverage.mean() * 100) if masks else None,
+        "unassigned_percent": float(unassigned.mean() * 100) if masks else None,
         "background_percent": float(background_mask.mean() * 100) if background_mask is not None else None,
-        "overlap_after_pixels": int(overlap.sum()),
+        "overlap_after_pixels": int(overlap.sum()) if masks else None,
         "overlap_before_pixels": None,
         "discarded_detections": max(
             0, len((metadata.get("grounding") or {}).get("detections") or []) - int(metadata.get("instance_count") or 0)
@@ -224,7 +224,7 @@ def analyse_moods(scene_root: str | Path, context: dict) -> list[dict]:
     generation = _load_json(generation_path) if generation_path.exists() else {}
     rows = []
     for mood in sorted((scene_root / "scene").glob("gsplat_scene_*.ply")):
-        if mood in day_candidates or mood.name == "gsplat_scene_active.ply":
+        if mood in day_candidates or mood.name in {"gsplat_scene_active.ply", "gsplat_scene_monolithic.ply"}:
             continue
         comparison = compare_topology(day, mood)
         rows.append({

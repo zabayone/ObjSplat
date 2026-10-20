@@ -94,12 +94,13 @@ def evaluate_editing(
     if not selected_layers and not selected_instances and object_layers:
         selected_layers = [object_layers[0]]
     source_candidates = [
-        scene_root / "scene" / "gsplat_scene_merged_refined.ply",
         scene_root / "scene" / "gsplat_scene_merged.ply",
     ]
     source = next((p for p in source_candidates if p.exists()), None)
     if source is None:
-        return [{**context, "status": "unavailable", "reason": "No merged scene PLY"}]
+        rows = [{**context, "status": "unavailable", "reason": "No merged scene PLY"}]
+        write_csv(output_dir / "editing_metrics.csv", rows, EDITING_COLUMNS)
+        return rows
     original_renderer = MLXSceneRenderer(source, rasterizer)
     image_dir = output_dir / "images" / "editing"
     representation_dir = output_dir / "edited_representations"
@@ -109,6 +110,12 @@ def evaluate_editing(
     targets += [("instance", int(value), instance_to_layer.get(int(value), -1)) for value in selected_instances]
     rows = []
     for target_type, target_id, layer_index in targets:
+        instance_ids = groups.get(layer_index, {}).get("instance_ids", [])
+        if target_type == "instance" and instance_ids != [target_id]:
+            rows.append({**context, "variant": "layered", "target_type": target_type,
+                         "target_id": target_id, "status": "unavailable",
+                         "reason": "No instance-specific projected mask; the group mask is not a valid substitute"})
+            continue
         mask_path, pose_path = _first_target_frame(scene_root, layer_index)
         if mask_path is None:
             rows.append({**context, "variant": "layered", "target_type": target_type,

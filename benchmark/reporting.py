@@ -9,7 +9,7 @@ import numpy as np
 
 from benchmark.io_utils import atomic_json, read_csv, write_csv
 from benchmark.schemas import (
-    EDITING_COLUMNS, LAYER_COLUMNS, MOOD_COLUMNS, RECONSTRUCTION_COLUMNS,
+    COMPARISON_COLUMNS, EDITING_COLUMNS, LAYER_COLUMNS, MOOD_COLUMNS, QUALITY_SCALING_COLUMNS, RECONSTRUCTION_COLUMNS,
     RENDERING_COLUMNS, RESOURCE_COLUMNS, SEGMENTATION_COLUMNS, STAGE_COLUMNS,
 )
 
@@ -19,6 +19,7 @@ TABLES = {
     "reconstruction_metrics.csv": RECONSTRUCTION_COLUMNS,
     "rendering_metrics.csv": RENDERING_COLUMNS, "editing_metrics.csv": EDITING_COLUMNS,
     "mood_metrics.csv": MOOD_COLUMNS,
+    "comparison_metrics.csv": COMPARISON_COLUMNS,
 }
 
 
@@ -33,9 +34,15 @@ def _number(value):
 def statistical_summary(values: list[float]) -> dict:
     data = np.asarray([v for v in values if v is not None and math.isfinite(v)], dtype=float)
     if not len(data):
-        return {key: None for key in ("count", "mean", "median", "std", "min", "max", "p25", "p75", "ci95_low", "ci95_high")}
-    mean, std = float(data.mean()), float(data.std(ddof=1)) if len(data) > 1 else 0.0
-    half = 1.96 * std / math.sqrt(len(data)) if len(data) > 1 else None
+        return {"count": 0, **{key: None for key in ("mean", "median", "std", "min", "max", "p25", "p75", "ci95_low", "ci95_high")}}
+    mean, std = float(data.mean()), float(data.std(ddof=1)) if len(data) > 1 else None
+    half = None
+    if len(data) > 1:
+        try:
+            from scipy.stats import t
+            half = float(t.ppf(0.975, df=len(data) - 1)) * std / math.sqrt(len(data))
+        except ImportError:
+            pass
     return {
         "count": int(len(data)), "mean": mean, "median": float(np.median(data)),
         "std": std, "min": float(data.min()), "max": float(data.max()),
@@ -68,9 +75,27 @@ def aggregate_results(input_root: str | Path, output_dir: str | Path) -> dict:
     input_root, output_dir = Path(input_root), Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    manifest = input_root / "selected_runs.json"
+    selected_dirs = None
+    if manifest.exists():
+        selected_dirs = {Path(item["output"]).resolve() for item in json.loads(manifest.read_text())}
+    else:
+        # Historical attempts are not independent scene replicates. Without an
+        # explicit selection manifest, use the latest attempt, including failures.
+        latest = {}
+        for summary in input_root.rglob("run_summary.json"):
+            if summary.parent == output_dir or "report" in summary.relative_to(input_root).parts:
+                continue
+            key = summary.parent.parent
+            if key not in latest or summary.stat().st_mtime_ns > latest[key].stat().st_mtime_ns:
+                latest[key] = summary
+        if latest:
+            selected_dirs = {path.parent.resolve() for path in latest.values()}
+
     def is_aggregate_artifact(path: Path) -> bool:
         return (
-            output_dir in path.parents
+            (selected_dirs is not None and path.parent.resolve() not in selected_dirs)
+            or output_dir in path.parents
             or any(parent.name == "report" for parent in path.parents)
         )
 
@@ -84,10 +109,74 @@ def aggregate_results(input_root: str | Path, output_dir: str | Path) -> dict:
         write_csv(output_dir / filename, rows, columns)
         aggregated[filename] = len(rows)
     reconstruction_rows = read_csv(output_dir / "reconstruction_metrics.csv")
+    scene_reconstruction_rows = scene_mean_rows(reconstruction_rows)
     rendering_rows = read_csv(output_dir / "rendering_metrics.csv")
     editing_rows = read_csv(output_dir / "editing_metrics.csv")
     mood_rows = read_csv(output_dir / "mood_metrics.csv")
     stage_rows = read_csv(output_dir / "stage_timings.csv")
+    comparison_rows = read_csv(output_dir / "comparison_metrics.csv")
+    quality_scaling_rows = []
+    for experiment, base_scene in sorted({(row.get("experiment", ""), row.get("base_scene", "")) for row in comparison_rows}):
+        scene_rows = [row for row in comparison_rows if row.get("base_scene") == base_scene and row.get("experiment", "") == experiment]
+        qualities = {row.get("quality") for row in scene_rows}
+        if len(qualities) < 2:
+            continue
+        by_quality_variant = {
+            (row.get("quality"), row.get("variant")): row for row in scene_rows
+        }
+        standard_layered = by_quality_variant.get(("standard", "layered"), {})
+        standard_monolithic = by_quality_variant.get(("standard", "monolithic"), {})
+
+        def percent_change(value, baseline):
+            return 100 * (value - baseline) / baseline if value is not None and baseline else None
+
+        for quality in ("low", "standard", "high", "ultra"):
+            if quality not in qualities:
+                continue
+            layered = by_quality_variant.get((quality, "layered"), {})
+            monolithic = by_quality_variant.get((quality, "monolithic"), {})
+            layered_time = _number(layered.get("training_time_seconds"))
+            monolithic_time = _number(monolithic.get("training_time_seconds"))
+            layered_memory = _number(layered.get("peak_training_rss_bytes"))
+            monolithic_memory = _number(monolithic.get("peak_training_rss_bytes"))
+            complete = all(value is not None for value in (
+                layered_time, monolithic_time, layered_memory, monolithic_memory,
+            ))
+            quality_scaling_rows.append({
+                "experiment": layered.get("experiment") or monolithic.get("experiment"),
+                "base_scene": base_scene,
+                "quality": quality,
+                "downsample_ratio": layered.get("downsample_ratio") or monolithic.get("downsample_ratio"),
+                "layered_training_time_seconds": layered_time,
+                "monolithic_training_time_seconds": monolithic_time,
+                "layered_peak_training_rss_bytes": layered_memory,
+                "monolithic_peak_training_rss_bytes": monolithic_memory,
+                "layered_speedup_percent": (
+                    100 * (monolithic_time - layered_time) / monolithic_time
+                    if layered_time is not None and monolithic_time else None
+                ),
+                "layered_peak_memory_reduction_percent": (
+                    100 * (monolithic_memory - layered_memory) / monolithic_memory
+                    if layered_memory is not None and monolithic_memory else None
+                ),
+                "baseline_quality": "standard",
+                "layered_time_change_vs_standard_percent": percent_change(
+                    layered_time, _number(standard_layered.get("training_time_seconds"))
+                ),
+                "monolithic_time_change_vs_standard_percent": percent_change(
+                    monolithic_time, _number(standard_monolithic.get("training_time_seconds"))
+                ),
+                "layered_memory_change_vs_standard_percent": percent_change(
+                    layered_memory, _number(standard_layered.get("peak_training_rss_bytes"))
+                ),
+                "monolithic_memory_change_vs_standard_percent": percent_change(
+                    monolithic_memory, _number(standard_monolithic.get("peak_training_rss_bytes"))
+                ),
+                "status": "success" if complete else "partial",
+                "reason": None if complete else "Missing paired training time or stage-local peak RSS",
+            })
+    write_csv(output_dir / "quality_scaling.csv", quality_scaling_rows, QUALITY_SCALING_COLUMNS)
+    aggregated["quality_scaling.csv"] = len(quality_scaling_rows)
     summaries = {
         "stage_wall_seconds": statistical_summary([
             value for row in stage_rows
@@ -106,7 +195,16 @@ def aggregate_results(input_root: str | Path, output_dir: str | Path) -> dict:
             if (value := _number(row.get("average_fps"))) is not None
         ]),
         "reconstruction_by_variant": grouped_metric_summary(
-            reconstruction_rows, "variant", ("psnr_db", "ssim", "lpips", "mae")
+            scene_reconstruction_rows, "variant", ("psnr_db", "ssim", "lpips", "mae")
+        ),
+        "comparison_by_variant": grouped_metric_summary(
+            comparison_rows,
+            "variant",
+            (
+                "psnr_db", "ssim", "lpips", "mae", "training_time_seconds",
+                "peak_training_rss_bytes", "average_fps", "mean_ms", "p95_ms",
+                "gaussian_count", "ply_size_bytes",
+            ),
         ),
         "rendering_by_variant": grouped_metric_summary(
             rendering_rows,
@@ -154,6 +252,7 @@ def aggregate_results(input_root: str | Path, output_dir: str | Path) -> dict:
         "pipeline_stage_by_name": grouped_metric_summary(
             stage_rows, "stage", ("wall_seconds", "peak_sampled_rss_bytes")
         ),
+        "aggregation_unit": "Scene-run means; paired comparisons require identical view IDs. CI uses Student t, without a significance test.",
         "scope_warning": (
             "The legacy reconstruction_psnr_db and rendering_fps summaries mix "
             "variants and are diagnostic only. Use the by-variant summaries for claims."
@@ -219,29 +318,53 @@ def _counts(values) -> dict:
     return result
 
 
+def scene_mean_rows(rows: list[dict]) -> list[dict]:
+    groups = {}
+    for row in rows:
+        if row.get("status") not in (None, "", "success"):
+            continue
+        key = tuple(row.get(k, "") for k in ("experiment", "scene", "run_id", "variant"))
+        groups.setdefault(key, []).append(row)
+    result = []
+    for key, values in groups.items():
+        row = dict(zip(("experiment", "scene", "run_id", "variant"), key))
+        for metric in ("psnr_db", "ssim", "lpips", "mae"):
+            numbers = [_number(value.get(metric)) for value in values]
+            numbers = [n for n in numbers if n is not None]
+            row[metric] = float(np.mean(numbers)) if numbers else None
+        result.append(row)
+    return result
+
+
 def paired_variant_summary(rows: list[dict], metric: str) -> dict:
-    by_scene: dict[str, dict[str, list[float]]] = {}
+    groups = {}
     for row in rows:
         value = _number(row.get(metric))
         variant = row.get("variant")
+        if row.get("status") not in (None, "", "success"):
+            continue
         if value is not None and variant in {"layered", "monolithic"}:
-            by_scene.setdefault(row.get("scene", ""), {}).setdefault(variant, []).append(value)
+            key = tuple(row.get(k, "") for k in ("experiment", "scene", "run_id"))
+            groups.setdefault(key, {}).setdefault(variant, {})[str(row.get("view_id", ""))] = value
     pairs = []
-    for variants in by_scene.values():
-        if variants.get("layered") and variants.get("monolithic"):
-            layered = float(np.mean(variants["layered"]))
-            monolithic = float(np.mean(variants["monolithic"]))
+    for key, variants in groups.items():
+        layered_views = variants.get("layered", {})
+        monolithic_views = variants.get("monolithic", {})
+        # Never compare different view subsets or different run attempts.
+        if layered_views and layered_views.keys() == monolithic_views.keys():
+            layered = float(np.mean(list(layered_views.values())))
+            monolithic = float(np.mean(list(monolithic_views.values())))
             pairs.append({
+                **dict(zip(("experiment", "scene", "run_id"), key)),
+                "matched_views": len(layered_views),
                 "layered": layered, "monolithic": monolithic,
                 "difference_monolithic_minus_layered": monolithic - layered,
-                "percent_difference": (monolithic - layered) / abs(layered) * 100 if layered else None,
             })
-    differences = [row["difference_monolithic_minus_layered"] for row in pairs]
     return {
         "pair_count": len(pairs), "pairs": pairs,
-        "difference_summary": statistical_summary(differences),
+        "difference_summary": statistical_summary([p["difference_monolithic_minus_layered"] for p in pairs]),
         "significance_test": None,
-        "note": "No automatic significance test; sample-size assumptions are not guaranteed.",
+        "note": "Paired within the same run and identical view sets; no automatic significance test.",
     }
 
 
@@ -264,6 +387,31 @@ def generate_plots(output_dir: str | Path) -> list[str]:
     edits = read_csv(output_dir / "editing_metrics.csv")
     moods = read_csv(output_dir / "mood_metrics.csv")
     resources = read_csv(output_dir / "resource_samples.csv")
+    comparisons = read_csv(output_dir / "comparison_metrics.csv")
+    comparison_plot_rows = [
+        {
+            **row,
+            "training_minutes": (
+                _number(row.get("training_time_seconds")) / 60
+                if _number(row.get("training_time_seconds")) is not None else None
+            ),
+            "peak_training_gib": (
+                _number(row.get("peak_training_rss_bytes")) / 1024 ** 3
+                if _number(row.get("peak_training_rss_bytes")) is not None else None
+            ),
+        }
+        for row in comparisons
+    ]
+    quality_plot_rows = [
+        {
+            **row,
+            "scene_quality": (
+                f"{row.get('base_scene')}:{row.get('quality')}:{row.get('variant')}"
+            ),
+        }
+        for row in comparison_plot_rows
+        if row.get("variant") in {"layered", "monolithic"} and row.get("quality")
+    ]
     try:
         aggregate_payload = json.loads((output_dir / "aggregated_summary.json").read_text())
         robustness = aggregate_payload.get("robustness", {})
@@ -315,6 +463,10 @@ def generate_plots(output_dir: str | Path) -> list[str]:
         ("training_time_vs_final_gaussians", "Training time vs final Gaussian count", "Final Gaussians", "Seconds", layers, "final_gaussians", "training_time_seconds", "scatter"),
         ("reconstruction_quality_comparison", "Reconstruction quality comparison", "Variant", "Mean PSNR (dB)", reconstruction, "variant", "psnr_db", "mean_bar"),
         ("monolithic_vs_layered", "Monolithic vs layered comparison", "Variant", "Mean PSNR (dB)", monolithic_layered, "variant", "psnr_db", "mean_bar"),
+        ("training_time_by_variant", "Training time by representation", "Variant", "Minutes", comparison_plot_rows, "variant", "training_minutes", "mean_bar"),
+        ("training_memory_by_variant", "Peak training memory by representation", "Variant", "GiB", comparison_plot_rows, "variant", "peak_training_gib", "mean_bar"),
+        ("quality_vs_training_time", "Per-scene quality vs training time", "Scene:quality:variant", "Minutes", quality_plot_rows, "scene_quality", "training_minutes", "bar"),
+        ("quality_vs_peak_memory", "Per-scene quality vs peak training memory", "Scene:quality:variant", "GiB", quality_plot_rows, "scene_quality", "peak_training_gib", "bar"),
         ("rendering_fps_vs_gaussians", "Rendering FPS vs Gaussian count", "Gaussians", "FPS", renders, "gaussian_count", "average_fps", "scatter"),
         ("edit_leakage_by_target", "Edit leakage by scene and target", "Scene:target", "Leakage ratio", edit_plot_rows, "scene_target", "edit_leakage_ratio", "mean_bar"),
         ("day_night_property_differences", "Day/night non-appearance differences", "Mood", "Changed Gaussians (%)", moods, "mood_variant", "nonappearance_changed_percent", "mean_bar"),
@@ -391,6 +543,7 @@ def generate_report(output_dir: str | Path, summary: dict | None = None) -> Path
     editing = statistics.get("editing_layered", {})
     mood = statistics.get("mood_topology", {})
     stages = statistics.get("pipeline_stage_by_name", {})
+    comparison = statistics.get("comparison_by_variant", {})
     paired = statistics.get("paired_monolithic_vs_layered", {})
     quality_rows = []
     for variant in ("layered", "refined", "monolithic"):
@@ -416,6 +569,59 @@ def generate_report(output_dir: str | Path, summary: dict | None = None) -> Path
             f"{formatted(mean(rendering[variant], 'ply_size_bytes'), 3, 1024 ** 3, ' GiB')} |"
         )
     difference = ((paired.get("difference_summary") or {}).get("mean"))
+    comparison_detail_rows = []
+    for row in read_csv(output_dir / "comparison_metrics.csv"):
+        comparison_detail_rows.append(
+            f"| {row.get('base_scene') or row.get('scene')} | {row.get('quality')} | "
+            f"{row.get('variant')} | {formatted(_number(row.get('psnr_db')), 2)} | "
+            f"{formatted(_number(row.get('ssim')), 3)} | "
+            f"{formatted(_number(row.get('lpips')), 3)} | "
+            f"{formatted(_number(row.get('mae')), 4)} | "
+            f"{formatted(_number(row.get('training_time_seconds')), 1, 60, ' min')} | "
+            f"{formatted(_number(row.get('peak_training_rss_bytes')), 2, 1024 ** 3, ' GiB')} | "
+            f"{formatted(_number(row.get('average_fps')), 3)} |"
+        )
+    quality_scaling_detail_rows = []
+    for row in read_csv(output_dir / "quality_scaling.csv"):
+        quality_scaling_detail_rows.append(
+            f"| {row.get('base_scene')} | {row.get('quality')} | "
+            f"{formatted(_number(row.get('downsample_ratio')), 2)}× | "
+            f"{formatted(_number(row.get('layered_training_time_seconds')), 1, 60, ' min')} | "
+            f"{formatted(_number(row.get('monolithic_training_time_seconds')), 1, 60, ' min')} | "
+            f"{formatted(_number(row.get('layered_speedup_percent')), 1, suffix='%')} | "
+            f"{formatted(_number(row.get('layered_peak_training_rss_bytes')), 2, 1024 ** 3, ' GiB')} | "
+            f"{formatted(_number(row.get('monolithic_peak_training_rss_bytes')), 2, 1024 ** 3, ' GiB')} | "
+            f"{formatted(_number(row.get('layered_peak_memory_reduction_percent')), 1, suffix='%')} |"
+        )
+    quality_scaling_lines = []
+    if quality_scaling_detail_rows:
+        quality_scaling_lines = [
+            "## Quality scaling by scene", "",
+            "Positive speed-up or memory-reduction values favour the layered representation.", "",
+            "| Scene | Quality | 3D support | Layered training | Monolithic training | Layered speed-up | Layered RSS | Monolithic RSS | RSS reduction |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|",
+            *quality_scaling_detail_rows,
+            "",
+        ]
+    optional_lines = []
+    if mean(editing, "edit_leakage_ratio") is not None:
+        optional_lines.extend([
+            "## Object-edit locality", "",
+            f"- Leakage: mean {formatted(mean(editing, 'edit_leakage_ratio'), 5)}, "
+            f"median {formatted(median(editing, 'edit_leakage_ratio'), 5)}",
+            f"- Locality: mean {formatted(mean(editing, 'edit_locality_score'), 5)}, "
+            f"median {formatted(median(editing, 'edit_locality_score'), 5)}",
+            "",
+        ])
+    if mean(mood, "nonappearance_changed_percent") is not None:
+        optional_lines.extend([
+            "## Day/night topology", "",
+            f"- Non-appearance properties changed: "
+            f"{formatted(mean(mood, 'nonappearance_changed_percent'), 5, suffix='%')}",
+            f"- Maximum position difference: "
+            f"{formatted(mean(mood, 'position_max_abs'), 6)}",
+            "",
+        ])
     lines = [
         "# ObjSplat Benchmark Report", "",
         "## Run status", "",
@@ -433,41 +639,26 @@ def generate_report(output_dir: str | Path, summary: dict | None = None) -> Path
         f"{formatted(difference, 3, suffix=' dB')}.",
         "",
         "## Computational efficiency", "",
-        f"- Complete pipeline: "
-        f"{formatted(mean(stages.get('complete_end_to_end', {}), 'wall_seconds'), 1, 60, ' min')}",
         f"- Layer training: "
-        f"{formatted(mean(stages.get('all_layer_training', {}), 'wall_seconds'), 1, 60, ' min')}",
+        f"{formatted(mean(comparison.get('layered', {}), 'training_time_seconds'), 1, 60, ' min')}",
         f"- Monolithic training: "
-        f"{formatted(mean(stages.get('monolithic_baseline', {}), 'wall_seconds'), 1, 60, ' min')}",
-        f"- Peak process memory: "
-        f"{formatted(mean(statistics.get('run_resources', {}), 'peak_process_rss_bytes'), 2, 1024 ** 3, ' GiB')}",
+        f"{formatted(mean(comparison.get('monolithic', {}), 'training_time_seconds'), 1, 60, ' min')}",
+        f"- Layered peak training memory: "
+        f"{formatted(mean(comparison.get('layered', {}), 'peak_training_rss_bytes'), 2, 1024 ** 3, ' GiB')}",
+        f"- Monolithic peak training memory: "
+        f"{formatted(mean(comparison.get('monolithic', {}), 'peak_training_rss_bytes'), 2, 1024 ** 3, ' GiB')}",
         "",
         "| Variant | FPS ↑ | Mean ms ↓ | p95 ms ↓ | Gaussian count | PLY size |",
         "|---|---:|---:|---:|---:|---:|",
         *rendering_rows,
         "",
-        "## Object-edit locality", "",
-        f"- Leakage: mean "
-        f"{formatted(mean(editing, 'edit_leakage_ratio'), 5)}, median "
-        f"{formatted(median(editing, 'edit_leakage_ratio'), 5)}",
-        f"- Locality: mean "
-        f"{formatted(mean(editing, 'edit_locality_score'), 5)}, median "
-        f"{formatted(median(editing, 'edit_locality_score'), 5)}",
-        f"- Outside changed pixels: "
-        f"{formatted(mean(editing, 'outside_changed_percent'), 2, suffix='%')} mean",
-        f"- Edit creation time: "
-        f"{formatted(mean(editing, 'creation_seconds'), 2, suffix=' s')} mean",
+        "## Per-scene comparison", "",
+        "| Scene | Quality | Variant | PSNR | SSIM | LPIPS | MAE | Training | Peak RSS | FPS |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|",
+        *comparison_detail_rows,
         "",
-        "## Day/night topology", "",
-        f"- Non-appearance properties changed: "
-        f"{formatted(mean(mood, 'nonappearance_changed_percent'), 5, suffix='%')}",
-        f"- Maximum position difference: "
-        f"{formatted(mean(mood, 'position_max_abs'), 6)}",
-        f"- Analytic fitting time: "
-        f"{formatted(mean(mood, 'analytic_fit_seconds'), 2, suffix=' s')}",
-        f"- Circular seam MAE: "
-        f"{formatted(mean(mood, 'circular_seam_mae'), 5)}",
-        "",
+        *quality_scaling_lines,
+        *optional_lines,
         "## Validity and limitations", "",
         "Held-out perspective views derived from the input ERP measure panorama reconstruction fidelity. "
         "They do not constitute independent viewpoints and must not be interpreted as true multi-view "
@@ -487,11 +678,11 @@ def generate_report(output_dir: str | Path, summary: dict | None = None) -> Path
     ]
     important_plots = (
         "monolithic_vs_layered",
-        "total_runtime_by_scene",
-        "peak_memory_by_scene",
+        "training_time_by_variant",
+        "training_memory_by_variant",
+        "quality_vs_training_time",
+        "quality_vs_peak_memory",
         "rendering_fps_vs_gaussians",
-        "edit_leakage_by_target",
-        "day_night_property_differences",
     )
     for stem in important_plots:
         png = output_dir / "plots" / f"{stem}.png"

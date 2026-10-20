@@ -31,12 +31,17 @@ def memory_snapshot() -> dict:
         mem = process.memory_info()
         result["process_rss_bytes"] = int(mem.rss)
         result["process_vms_bytes"] = int(mem.vms)
-        result["process_cpu_percent"] = float(process.cpu_percent(interval=None))
+        # A newly created psutil.Process has no CPU sampling interval; its
+        # first cpu_percent call would fabricate a zero. Leave it unavailable.
     except (OSError, PermissionError, psutil.Error):
         return result
     child_mem = []
     try:
-        child_mem = [child.memory_info() for child in process.children(recursive=True)]
+        for child in process.children(recursive=True):
+            try:
+                child_mem.append(child.memory_info())
+            except (OSError, PermissionError, psutil.Error):
+                continue
     except (OSError, PermissionError, psutil.Error):
         pass
     result["process_rss_bytes"] = int(mem.rss + sum(item.rss for item in child_mem))
@@ -76,6 +81,7 @@ class ResourceSampler:
         self._start = 0.0
         self.last_sample: dict | None = None
         self.peak_rss = 0
+        self.peak_rss_by_stage: dict[str, int] = {}
 
     def start(self) -> None:
         if self._thread is not None:
@@ -95,6 +101,11 @@ class ResourceSampler:
         rss = row.get("process_rss_bytes")
         if rss is not None:
             self.peak_rss = max(self.peak_rss, int(rss))
+            stage = str(row.get("stage") or "")
+            if stage:
+                self.peak_rss_by_stage[stage] = max(
+                    self.peak_rss_by_stage.get(stage, 0), int(rss)
+                )
         self.last_sample = row
         append_csv(self.output, row, RESOURCE_COLUMNS)
 
@@ -112,6 +123,10 @@ class ResourceSampler:
         self._stop.set()
         self._thread.join(timeout=max(2.0, self.interval * 2))
         self._thread = None
+        try:
+            self._sample()
+        except Exception:
+            pass
 
     def __enter__(self):
         self.start()

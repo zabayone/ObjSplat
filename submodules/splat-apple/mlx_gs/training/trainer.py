@@ -123,33 +123,26 @@ def _repulsion_loss(means, max_samples: int = 512, min_dist: float = 0.02):
 def _clamp_params(params, scale_log_min: float = -7.0, scale_log_max: float = 0.1):
     """Sanitize MLX gaussian parameters after each optimizer step."""
 
-    try:
-        scale_arr = params["scales"] if isinstance(params, dict) else params.scales
-        scale_arr = mx.nan_to_num(scale_arr, nan=-3.0, posinf=2.0, neginf=-7.0)
-        scale_arr = mx.clip(scale_arr, scale_log_min, scale_log_max)
-        if isinstance(params, dict):
-            params["scales"] = scale_arr
-        else:
-            params.scales = scale_arr
+    def get(key):
+        return params[key] if isinstance(params, dict) else getattr(params, key)
 
-        quat_arr = params["quaternions"] if isinstance(params, dict) else params.quaternions
-        quat_arr = mx.nan_to_num(quat_arr, nan=0.0)
-        quat_norm = mx.sqrt(mx.sum(mx.square(quat_arr), axis=-1, keepdims=True) + 1e-12)
-        quat_arr = quat_arr / quat_norm
+    def put(key, value):
         if isinstance(params, dict):
-            params["quaternions"] = quat_arr
+            params[key] = value
         else:
-            params.quaternions = quat_arr
+            setattr(params, key, value)
 
-        op_arr = params["opacities"] if isinstance(params, dict) else params.opacities
-        op_arr = mx.nan_to_num(op_arr, nan=-2.0, posinf=6.0, neginf=-10.0)
-        op_arr = mx.clip(op_arr, -4.0, 6.0)
-        if isinstance(params, dict):
-            params["opacities"] = op_arr
-        else:
-            params.opacities = op_arr
-    except Exception:
-        pass
+    keys = set(params) if isinstance(params, dict) else {"scales", "quaternions", "opacities"}
+    if "scales" in keys:
+        scales = mx.nan_to_num(get("scales"), nan=-3.0, posinf=2.0, neginf=-7.0)
+        put("scales", mx.clip(scales, scale_log_min, scale_log_max))
+    if "quaternions" in keys:
+        quat = mx.nan_to_num(get("quaternions"), nan=0.0)
+        norm = mx.sqrt(mx.sum(mx.square(quat), axis=-1, keepdims=True) + 1e-12)
+        put("quaternions", quat / norm)
+    if "opacities" in keys:
+        opacity = mx.nan_to_num(get("opacities"), nan=-2.0, posinf=6.0, neginf=-10.0)
+        put("opacities", mx.clip(opacity, -4.0, 6.0))
 
 def train_step(
     params,
@@ -223,17 +216,26 @@ def train_step(
 
         return loss, image
 
-    loss_and_grad_fn = mx.value_and_grad(wrapped_loss)
-    (loss, rendered_image), grads = loss_and_grad_fn(params)
-
     if isinstance(optimizers, dict):
-        for key in grads:
-            if key in optimizers:
-                params[key] = optimizers[key].apply_gradients({key: grads[key]}, {key: params[key]})[key]
-    else:
-        optimizers.update(params, grads)
+        if not optimizers:
+            raise ValueError("No trainable gaussian parameters selected")
+        # Differentiate only optimizer-owned arrays. Frozen values are still
+        # required by the renderer, but need neither gradients nor Adam state.
+        trainable = {key: params[key] for key in optimizers}
+        frozen = {key: value for key, value in params.items() if key not in optimizers}
 
-    _clamp_params(params, scale_log_min, scale_log_max)
+        def selected_loss(selected):
+            return wrapped_loss({**frozen, **selected})
+
+        (loss, rendered_image), grads = mx.value_and_grad(selected_loss)(trainable)
+        for key, optimizer in optimizers.items():
+            trainable[key] = optimizer.apply_gradients({key: grads[key]}, {key: trainable[key]})[key]
+        _clamp_params(trainable, scale_log_min, scale_log_max)
+        params.update(trainable)
+    else:
+        (loss, rendered_image), grads = mx.value_and_grad(wrapped_loss)(params)
+        optimizers.update(params, grads)
+        _clamp_params(params, scale_log_min, scale_log_max)
 
     rendered_image, target_image = _align_image_pair(rendered_image, target_image)
     target_mask = _align_mask(target_mask, rendered_image)

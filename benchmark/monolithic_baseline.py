@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import random
 import sys
 from pathlib import Path
 
@@ -14,6 +15,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mps_splat_backend import train_with_splat_apple
+from benchmark.runtime_hooks import pipeline_stage
 
 
 def _read_points(path: Path):
@@ -25,7 +27,8 @@ def _read_points(path: Path):
 
 
 def build_traindata(
-    scene_root: Path, image_size: int, max_points: int = 0, seed: int = 42
+    scene_root: Path, image_size: int, max_points: int = 0, seed: int = 42,
+    downsample_ratio: float = 1.0,
 ) -> dict:
     clouds = [_read_points(path) for path in sorted((scene_root / "traindata").glob("layer*/pcd_rgb_layer*.ply"))]
     if not clouds:
@@ -45,6 +48,18 @@ def build_traindata(
         frames.append({"image": image, "transform_matrix": np.load(pose_path)})
     if not frames:
         raise RuntimeError("No monolithic training frames found")
+    ratio = float(downsample_ratio)
+    if not 0 < ratio <= 1:
+        raise ValueError("downsample_ratio must be in (0, 1]")
+    if 0.0 < ratio < 1.0:
+        sampled_clouds = []
+        for points, colors, labels in clouds:
+            if not len(points):
+                continue
+            target = max(1, int(round(len(points) * ratio)))
+            selected = np.linspace(0, len(points) - 1, num=target, dtype=np.int64)
+            sampled_clouds.append((points[selected], colors[selected], labels[selected]))
+        clouds = sampled_clouds
     points = np.concatenate([x[0] for x in clouds])
     colors = np.concatenate([x[1] for x in clouds])
     labels = np.concatenate([x[2] for x in clouds])
@@ -54,12 +69,14 @@ def build_traindata(
             rng.choice(len(points), size=int(max_points), replace=False)
         )
         points, colors, labels = points[selected], colors[selected], labels[selected]
+    with Image.open(scene_root / "rgb.png") as panorama:
+        erp_height = panorama.height
     return {
+        "erp_height": erp_height,
         "fov": 90, "W": frames[0]["image"].width, "H": frames[0]["image"].height,
         "pcd_points": points,
         "pcd_colors": colors,
         "pcd_labels": labels,
-        "pcd_masks": np.ones((len(points), 3), dtype=np.float32),
         "frames": frames,
     }
 
@@ -74,15 +91,22 @@ def main() -> None:
     parser.add_argument("--adaptive", action="store_true")
     parser.add_argument("--max_points", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--downsample_ratio", type=float, default=1.0)
     args = parser.parse_args()
-    data = build_traindata(
-        Path(args.scene_root), args.image_size, args.max_points, args.seed
-    )
-    train_with_splat_apple(
-        data, args.output, num_iterations=args.iterations, rasterizer=args.rasterizer,
-        adaptive=args.adaptive, downsample_ratio=1.0, max_points=args.max_points,
-        training_profile="layer_instances",
-    )
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    import mlx.core as mx
+    mx.random.seed(args.seed)
+    with pipeline_stage("monolithic_training_process", iterations=args.iterations):
+        data = build_traindata(
+            Path(args.scene_root), args.image_size, args.max_points, args.seed,
+            args.downsample_ratio,
+        )
+        train_with_splat_apple(
+            data, args.output, num_iterations=args.iterations, rasterizer=args.rasterizer,
+            adaptive=args.adaptive, downsample_ratio=1.0, max_points=args.max_points,
+            training_profile="layer_instances",
+        )
 
 
 if __name__ == "__main__":

@@ -55,6 +55,8 @@ class MLXSceneRenderer:
         return np.clip(np.asarray(image) * 255.0, 0, 255).astype(np.uint8)
 
     def benchmark(self, poses, width: int, height: int, warmup: int, measured: int) -> dict:
+        if width <= 0 or height <= 0 or measured <= 0 or warmup < 0:
+            raise ValueError("Positive resolution/measured frames and non-negative warmup required")
         poses = list(poses)
         if not poses:
             raise ValueError("At least one camera pose is required")
@@ -62,7 +64,7 @@ class MLXSceneRenderer:
         image = self._render_mlx(poses[0], width, height)
         self.mx.eval(image)
         cold_seconds = time.perf_counter() - cold_start
-        for index in range(max(0, warmup - 1)):
+        for index in range(warmup):
             image = self._render_mlx(poses[index % len(poses)], width, height)
             self.mx.eval(image)
         timings = []

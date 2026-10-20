@@ -122,3 +122,11 @@ def validate_config(config: dict) -> None:
             raise ValueError(
                 "rerun_segmentation must be false when shared preprocessing is enabled"
             )
+
+    if config.get("rerun_segmentation") and any(s.get("shared_preprocessing_root") for s in scenes):
+        raise ValueError("Cannot rerun segmentation on shared preprocessing")
+    rendering = config.get("rendering", {})
+    if any(int(rendering.get(key, default)) <= 0 for key, default in (("width", 512), ("height", 512), ("measured_frames", 30))):
+        raise ValueError("Rendering resolution and measured_frames must be positive")
+    if int(rendering.get("warmup_frames", 5)) < 0:
+        raise ValueError("warmup_frames must be non-negative")

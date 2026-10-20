@@ -20,6 +20,12 @@ an exception. Resource samples are appended approximately once per configured
 interval. On Apple Silicon, RSS and system memory are unified-memory estimates,
 not CUDA VRAM.
 
+The layered/monolithic comparison reports stage-local process-tree peaks:
+`all_layer_training` for the layered representation and
+`monolithic_training_process` for the joint representation. The maximum of the complete
+benchmark process is retained for diagnostics but is not used as either
+variant's training-memory result.
+
 ## Timings and resources
 
 Wall time and CPU process time are measured independently. Structured stages
@@ -83,6 +89,27 @@ all Gaussians are optimized jointly rather than as independent semantic layers.
 This difference and the chosen budget are retained in the configuration, so the
 comparison is controlled but not claimed to be perfectly equivalent.
 
+Non-adaptive comparison runs use no per-layer Gaussian cap. The exporter repairs
+non-finite learned appearance/shape attributes with finite neutral values and,
+when topology is unchanged, restores invalid positions from the input cloud.
+The benchmark rejects any layer retaining less than 95% of its input Gaussian
+support, preventing a numerically damaged, visibly incomplete scene from being
+accepted as a valid result.
+
+## Quality scaling
+
+The quality sweep keeps layer, background, and sky iteration counts fixed and
+changes only the sampled fraction of a common full-resolution 3D support:
+`low` = 0.25, `standard` = 0.50, `high` = 0.75, and `ultra` = 1.00. The source
+ERP, segmentation, held-out split, training-image size, renderer, topology
+policy, and random seed remain fixed. This isolates the training cost of scene
+support density without making segmentation a resolution-dependent confound.
+The sweep uses one indoor and one outdoor scene and reports training wall time
+and stage-local peak RSS for both layered and monolithic training; it does not
+run retexturing. Every quality level is paired within the same scene and is also
+compared with that variant's `standard` run before cross-scene summaries are
+produced.
+
 ## Rendering performance
 
 The first render is reported as cold start. Warm-up renders are discarded.
@@ -127,10 +154,59 @@ distance because exact stored-topology preservation is the tested invariant.
 ## Statistics, failures, and limitations
 
 Across scenes the report includes count, mean, median, sample standard deviation,
-minimum, maximum, quartiles, and a normal-approximation 95% confidence interval
-when at least two observations exist. No significance test is run automatically.
+minimum, maximum, quartiles, and a Student-t 95% confidence interval
+when at least two observations exist and SciPy is available. Reconstruction
+statistics first average views within each scene/run/variant, so a scene with
+more held-out frames does not receive extra weight. These intervals assume
+independent scene-level observations and are descriptive for this small,
+purposefully chosen scene set; they do not establish population-wide performance. No significance test is run automatically.
 
 Runs are `success`, `partial_success`, or `failed`. Completed CSV rows survive
 failure. The failed stage, exception type/message, last resource sample, and
 successfully detected outputs are retained. Optional or technically impossible
 metrics remain null with an explanation; values are never fabricated.
+
+
+## Protocol corrections and result provenance (2026-09-05)
+
+Downsampling is applied once, before both representations enter the trainer.
+The monolithic subprocess seeds Python, NumPy and MLX and carries the original
+ERP height into scale initialization. The existing fixed budgets remain 800
+iterations per object layer, 1000 for background, 500 for sky and 1000 for the
+whole monolithic scene. They are explicit method budgets, not equal total
+iterations or equal compute. Layer masks, layer-dependent scale statistics and
+small-layer regularization also differ from joint training.
+
+A benchmark validates the actual stored view split and layer frame filenames,
+including its match to the configured seed/fraction. Holding out optimization
+views does not hide their panorama pixels from depth, segmentation or initial
+point colors. This is a same-panorama reconstruction experiment.
+
+Reuse fingerprints include source code contents (including dirty files), input
+panorama hash and preprocessing manifests. This does not hash all multi-GB PLY
+payloads or model checkpoints: shared preprocessing must remain immutable.
+Selected run directories are written to `selected_runs.json`; aggregation uses
+that manifest, or the latest attempt per scene directory for historical runs.
+Attempts are not pooled as independent replicates. Paired fidelity requires the
+same experiment, scene, run and view IDs. Failed/unavailable requested metrics
+make a run partial and prevent automatic successful-run reuse.
+
+`peak_training_rss_bytes` is a sampled sum of RSS over the training process tree.
+It may count shared pages more than once and is neither unique physical memory
+nor a separate GPU-VRAM counter. Sampling can miss short peaks. The parent and
+child resource CSV writers use file locking. CPU percentages without a valid
+sampling interval are null; stage CPU seconds cover the recording process, not
+all subprocess CPU time.
+
+Rendering cold-start time is the first render for that renderer instance, not
+a fresh-process or cold-driver measurement (reconstruction evaluation can have
+already warmed Metal). It excludes PLY loading. Exactly the configured number
+of additional warm-up frames is discarded before steady-state timings.
+
+Instance edit locality is unavailable when only a multi-instance group mask is
+available. Layer deletion is compared against the unrefined merged scene,
+avoiding a confound from combining refined before-images with unrefined layers.
+
+See [the audit](BENCHMARK_AUDIT.md) for validation and the treatment of historical
+results. Do not combine pre-correction and post-correction training-time/RAM
+results: the trainer's SH allocation and frozen-parameter behavior also changed.

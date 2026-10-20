@@ -134,16 +134,14 @@ def _voxel_downsample(
     return_indices: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
     if len(points) == 0:
-        return points, colors, labels
+        result = (points, colors, labels)
+        return (*result, np.empty(0, dtype=np.int64)) if return_indices else result
+    if not np.isfinite(voxel_size) or voxel_size <= 0:
+        raise ValueError("voxel_size must be finite and positive")
     min_pt = points.min(axis=0)
-    quantized = ((points - min_pt) / voxel_size).astype(np.int32)
-    max_coord = quantized.max(axis=0) + 1
-    hash_vals = (
-        quantized[:, 0] * (max_coord[1] * max_coord[2])
-        + quantized[:, 1] * max_coord[2]
-        + quantized[:, 2]
-    )
-    _, unique_idx = np.unique(hash_vals, return_index=True)
+    quantized = np.floor((points - min_pt) / voxel_size).astype(np.int64)
+    # Unique coordinate rows avoid overflow/collisions in a flattened grid hash.
+    _, unique_idx = np.unique(quantized, axis=0, return_index=True)
     unique_idx = np.sort(unique_idx)
     ds_points = points[unique_idx]
     ds_colors = colors[unique_idx]
@@ -224,15 +222,21 @@ def extract_gaussian_params_from_ply(ply_path: str) -> Tuple[Dict[str, np.ndarra
     # Collect all f_rest_* fields
     vertex_names = getattr(getattr(vertex, "data", vertex), "dtype", None)
     vertex_names = getattr(vertex_names, "names", ()) or ()
-    f_rest_fields = [k for k in vertex_names if k.startswith("f_rest_")]
+    f_rest_fields = sorted(
+        (k for k in vertex_names if k.startswith("f_rest_")),
+        key=lambda key: int(key.rsplit("_", 1)[1]),
+    )
     f_rest = np.stack([vertex[k] for k in f_rest_fields], axis=1).astype(np.float32) if f_rest_fields else np.zeros((len(means), 0), dtype=np.float32)
     
-    # Reshape to (N, (sh_degree+1)^2 - 1, 3)
-    n_coeffs = 3 * len(f_rest_fields) // 3  # Should be 3 * (sh_degree^2)
-    sh_coeffs = np.zeros((len(means), 16, 3), dtype=np.float32)  # Assuming sh_degree=3
+    if len(f_rest_fields) % 3:
+        raise ValueError("PLY SH fields must contain three equally sized color channels")
+    rest_count = len(f_rest_fields) // 3
+    sh_coeffs = np.zeros((len(means), rest_count + 1, 3), dtype=np.float32)
     sh_coeffs[:, 0, :] = f_dc
-    sh_coeffs[:, 1:, :] = f_rest.reshape(len(means), -1, 3) if f_rest.size > 0 else np.zeros((len(means), 15, 3), dtype=np.float32)
-    
+    if rest_count:
+        # PLY stores channel-major coefficients, not interleaved RGB triples.
+        sh_coeffs[:, 1:, :] = f_rest.reshape(len(means), 3, rest_count).transpose(0, 2, 1)
+
     labels = None
     if "label" in vertex_names:
         labels = vertex["label"].astype(np.int32)
@@ -653,7 +657,7 @@ def _build_training_batch_mlx(traindata: Dict, downsample_ratio: float = 1.0):
         if frozen_mask is not None:
             frozen_mask = np.asarray(frozen_mask, dtype=bool).reshape(-1)[keep_idx]
 
-    if rgb.max() > 1.0:
+    if rgb.size and rgb.max() > 1.0:
         rgb = rgb / 255.0
     rgb = np.clip(rgb, 0.0, 1.0)
     return xyz, rgb, labels, frozen_mask, cameras, targets, target_masks
@@ -700,10 +704,13 @@ def _save_layerpano_compatible_ply_mlx(
     scale_log_min: float = -7.0,
     scale_log_max: float = 0.28,
     sh_degree: int = 3,
+    fallback_xyz: Optional[np.ndarray] = None,
+    freeze_geometry: bool = False,
+    freeze_opacity: bool = False,
 ) -> None:
     params = dict(params)
 
-    xyz = np.asarray(params["means"], dtype=np.float32)
+    xyz = np.asarray(params["means"], dtype=np.float32).copy()
     normals = np.zeros_like(xyz, dtype=np.float32)
     sh_coeffs = np.asarray(params["sh_coeffs"], dtype=np.float32)
 
@@ -720,31 +727,64 @@ def _save_layerpano_compatible_ply_mlx(
     )
 
     opacities = np.asarray(params["opacities"], dtype=np.float32)
-    opacities = np.clip(opacities, -4.0, 6.0)
+    opacities = opacities.copy() if freeze_opacity else np.clip(opacities, -4.0, 6.0)
 
     scales = np.asarray(params["scales"], dtype=np.float32)
-    scales = np.clip(scales, scale_log_min, scale_log_max)
-    params["scales"] = scales
+    scales = scales.copy() if freeze_geometry else np.clip(scales, scale_log_min, scale_log_max)
 
     if scales.ndim == 1:
         scales = scales[:, None]
 
-    if not np.isfinite(scales).all():
-        raise ValueError("Non-finite scales detected before export")
+    rots = np.asarray(params["quaternions"], dtype=np.float32).copy()
 
-    rots = np.asarray(params["quaternions"], dtype=np.float32)
-
-    finite_mask = (
-        np.isfinite(xyz).all(axis=1)
-        & np.isfinite(f_dc).all(axis=1)
-        & np.isfinite(f_rest).all(axis=1)
-        & np.isfinite(opacities).all(axis=1)
-        & np.isfinite(scales).all(axis=1)
-        & np.isfinite(rots).all(axis=1)
+    # Do not turn a numerical issue in one learned attribute into a hole in
+    # the reconstructed layer.  When topology is unchanged, restore invalid
+    # positions from the input cloud and replace other invalid attributes with
+    # finite neutral values.  Previously the whole Gaussian was discarded.
+    bad_xyz = ~np.isfinite(xyz).all(axis=1)
+    fallback_xyz = (
+        np.asarray(fallback_xyz, dtype=np.float32)
+        if fallback_xyz is not None else None
     )
+    if bad_xyz.any() and fallback_xyz is not None and fallback_xyz.shape == xyz.shape:
+        xyz[bad_xyz] = fallback_xyz[bad_xyz]
+        print(
+            f"Recovered {int(bad_xyz.sum())} non-finite Gaussian positions "
+            "from the input point cloud before export.",
+            flush=True,
+        )
+
+    bad_dc = ~np.isfinite(f_dc)
+    bad_rest = ~np.isfinite(f_rest)
+    bad_opacity = ~np.isfinite(opacities)
+    bad_scale = ~np.isfinite(scales)
+    bad_rotation = ~np.isfinite(rots)
+    f_dc[bad_dc] = 0.0
+    f_rest[bad_rest] = 0.0
+    opacities[bad_opacity] = float(_logit(0.1))
+    scales[bad_scale] = float(scale_log_min)
+    rots[bad_rotation] = 0.0
+    bad_rotation_rows = bad_rotation.any(axis=1)
+    if bad_rotation_rows.any():
+        rots[bad_rotation_rows, 0] = 1.0
+    repaired = int(
+        bad_dc.sum() + bad_rest.sum() + bad_opacity.sum()
+        + bad_scale.sum() + bad_rotation.sum()
+    )
+    if repaired:
+        print(
+            f"Recovered {repaired} non-finite Gaussian attribute values before export.",
+            flush=True,
+        )
+
+    finite_mask = np.isfinite(xyz).all(axis=1)
 
     if not np.all(finite_mask):
-        print(f"Filtering out {int((~finite_mask).sum())} non-finite gaussians before export.")
+        print(
+            f"Filtering out {int((~finite_mask).sum())} Gaussian positions that "
+            "could not be recovered before export.",
+            flush=True,
+        )
         xyz = xyz[finite_mask]
         normals = normals[finite_mask]
         f_dc = f_dc[finite_mask]
@@ -772,6 +812,7 @@ def _save_layerpano_compatible_ply_mlx(
         scales=scales,
         rots=rots,
         labels=labels_np,
+        normalize_rotations=not freeze_geometry,
     )
 
 
@@ -847,6 +888,10 @@ def _train_mlx(
         raise ValueError("Point cloud entirely NaN/Inf.")
     if not np.all(finite_mask):
         xyz = xyz[finite_mask]; rgb = rgb[finite_mask]
+        if initial_gaussian_params is not None:
+            initial_gaussian_params = {k: np.asarray(v)[finite_mask] for k, v in initial_gaussian_params.items()}
+        if frozen_mask is not None and len(frozen_mask) == len(finite_mask):
+            frozen_mask = np.asarray(frozen_mask)[finite_mask]
         if labels is not None:
             labels = labels[finite_mask]
 
@@ -875,7 +920,9 @@ def _train_mlx(
         gaussians = init_gaussians_from_pcd(
             np.asarray(xyz, dtype=np.float32),
             np.asarray(rgb, dtype=np.float32),
-            sh_degree=3,
+            # The current MLX renderer evaluates only degrees 0 and 1.
+            # Pad unused higher orders only when exporting the PLY.
+            sh_degree=1,
             scale_init=scale_init,
             opacity_init=opacity_init,
         )
@@ -886,10 +933,12 @@ def _train_mlx(
             "opacities":   gaussians.opacities,
             "sh_coeffs":   gaussians.sh_coeffs,
         }
-    initial_opacities_np = None
+        del gaussians, scale_init  # Do not retain the initial full-scene buffers.
+    if freeze_geometry or freeze_sh_coeffs or freeze_opacity:
+        adaptive = False  # Topology changes would alter frozen attributes.
+    initial_opacities_mx = None
     if preserve_initial_opacity_floor:
-        initial_opacities_np = np.asarray(params["opacities"], dtype=np.float32).copy()
-        initial_opacities_mx = mx.array(initial_opacities_np, dtype=mx.float32)
+        initial_opacities_mx = params["opacities"]
         opacity_refine_max_delta = float(os.environ.get("SPLAT_REFINE_OPACITY_MAX_DELTA", "1.0") or "1.0")
         initial_opacity_ceiling_mx = initial_opacities_mx + float(opacity_refine_max_delta)
     else:
@@ -916,7 +965,7 @@ def _train_mlx(
     optimizers = make_optimizers(current_lr_mult)
     max_points_cap = int(os.environ.get("SPLAT_MLX_MAX_POINTS_CAP", "0") or "0")
     if max_points is None and not unlimited_points:
-        init_points = int(gaussians.means.shape[0])
+        init_points = int(params["means"].shape[0])
         growth = float(os.environ.get("SPLAT_DENSIFY_GROWTH", "1.10") or "1.10")
         growth = max(1.0, growth)
         max_points = int(max(120_000, init_points * growth))
@@ -965,14 +1014,7 @@ def _train_mlx(
     for i in progress:
         cam_idx = camera_schedule[i]
         progress_fraction = float(i) / float(max(1, num_iterations))
-        if progress_fraction < 0.15:
-            active_sh_degree = 0
-        elif progress_fraction < 0.40:
-            active_sh_degree = 1
-        elif progress_fraction < 0.70:
-            active_sh_degree = 2
-        else:
-            active_sh_degree = 3
+        active_sh_degree = 1 if initial_gaussian_params is not None or progress_fraction >= 0.15 else 0
         loss, _, psnr, _ = train_step(
             params, optimizers, targets[cam_idx], cameras[cam_idx],
             target_mask=target_masks[cam_idx],
@@ -1011,10 +1053,13 @@ def _train_mlx(
 
         if lr_plateau_patience is not None and lr_plateau_patience > 0:
             if no_improve_lr >= lr_plateau_patience:
-                # Reduce LR by recreating optimizers with a multiplicative factor
                 current_lr_mult *= float(lr_plateau_factor)
-                # Recreate optimizers with scaled base learning rates
-                optimizers = make_optimizers(current_lr_mult)
+                # Keep Adam moments when reducing the learning rate.
+                for optimizer in optimizers.values():
+                    optimizer.learning_rate = max(
+                        float(lr_plateau_min_lr),
+                        float(optimizer.learning_rate) * float(lr_plateau_factor),
+                    )
                 no_improve_lr = 0
                 print(f"[splat-apple-mlx] lr reduced on plateau (mult={current_lr_mult:.4f})", flush=True)
 
@@ -1035,18 +1080,18 @@ def _train_mlx(
                 flush=True,
             )
 
-        if i > 0 and i % 3000 == 0:
+        if not freeze_opacity and initial_gaussian_params is None and i > 0 and i % 3000 == 0:
             reset_val = float(_logit(opacity_init))
             params["opacities"] = mx.full(params["opacities"].shape, reset_val, dtype=mx.float32)
-            if initial_opacities_mx is not None and tuple(initial_opacities_np.shape) == tuple(params["opacities"].shape):
+            if initial_opacities_mx is not None and tuple(initial_opacities_mx.shape) == tuple(params["opacities"].shape):
                 params["opacities"] = mx.minimum(
                     mx.maximum(params["opacities"], initial_opacities_mx),
                     initial_opacity_ceiling_mx,
                 )
-            optimizers = make_optimizers()
+            optimizers = make_optimizers(current_lr_mult)
             print(f"[splat-apple-mlx] iter={i} opacity reset", flush=True)
 
-        if initial_opacities_mx is not None and tuple(initial_opacities_np.shape) == tuple(params["opacities"].shape):
+        if initial_opacities_mx is not None and tuple(initial_opacities_mx.shape) == tuple(params["opacities"].shape):
             params["opacities"] = mx.minimum(
                 mx.maximum(params["opacities"], initial_opacities_mx),
                 initial_opacity_ceiling_mx,
@@ -1071,7 +1116,7 @@ def _train_mlx(
                 split_scale_factor=2.0,
             )
             params     = {k: mx.array(v, dtype=mx.float32) for k, v in np_params.items()}
-            optimizers = make_optimizers()
+            optimizers = make_optimizers(current_lr_mult)
 
     # Preserve the original point cloud scale to avoid MLX shrinking/expanding the scene.
     if not freeze_geometry:
@@ -1087,7 +1132,7 @@ def _train_mlx(
         params["scales"] = mx.clip(params["scales"], scale_log_min, scale_log_max)
 
     final_params = {k: np.asarray(v, dtype=np.float32) for k, v in params.items()}
-    if small_object_layer and "opacities" in final_params:
+    if small_object_layer and not freeze_opacity and initial_gaussian_params is None:
         final_params["opacities"] = np.maximum(final_params["opacities"], _logit(0.12)).astype(np.float32)
     _save_layerpano_compatible_ply_mlx(
         out_ply_path,
@@ -1096,6 +1141,9 @@ def _train_mlx(
         scale_log_min=scale_log_min,
         scale_log_max=scale_log_max,
         sh_degree=3,
+        fallback_xyz=(xyz if len(xyz) == len(final_params["means"]) else None),
+        freeze_geometry=freeze_geometry,
+        freeze_opacity=freeze_opacity or preserve_initial_opacity_floor,
     )
     completed_iterations = int(i + 1) if num_iterations > 0 else 0
     record_stage(

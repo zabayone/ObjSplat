@@ -10,6 +10,19 @@ from utils.open_ply_in_supersplat import build_viewer_url, resolve_scene_context
 
 
 class SuperSplatMoodBridgeTests(unittest.TestCase):
+    def test_regular_scene_directory_needs_no_mood_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            scene = root / "scene"
+            scene.mkdir()
+            merged = scene / "gsplat_scene_merged.ply"
+            merged.touch()
+
+            ply, server_root, manifest = resolve_scene_context(root)
+            self.assertEqual(ply, merged)
+            self.assertEqual(server_root, root)
+            self.assertIsNone(manifest)
+
     def test_scene_directory_resolves_active_mood(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()

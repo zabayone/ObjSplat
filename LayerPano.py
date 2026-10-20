@@ -15,7 +15,6 @@ import math
 from PIL import Image
 from tqdm import tqdm
 import torch
-import torch.nn.functional as F
 from plyfile import PlyData
 from torchvision.transforms import ToPILImage, ToTensor
 from scipy.spatial import cKDTree
@@ -58,28 +57,6 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-
-get_kernel = lambda p: torch.ones(1, 1, p * 2 + 1, p * 2 + 1).to('cuda')
-t2np = lambda x: (x[0].permute(1, 2, 0).clamp_(0, 1) * 255.0).to(torch.uint8).detach().cpu().numpy()
-np2t = lambda x: (torch.as_tensor(x).to(torch.float32).permute(2, 0, 1) / 255.0)[None, ...].to('cuda')
-pad_mask = lambda x, padamount=1: t2np(
-    F.conv2d(np2t(x[..., None]), get_kernel(padamount), padding=padamount))[..., 0].astype(bool)
-
-
-
-def check_cuda_memo(info="", device=0):
-    print(f"================= cuda memory info {info} ==================")
-    total_memory = torch.cuda.get_device_properties(device).total_memory
-    allocated_memory = torch.cuda.memory_allocated(device)
-    cached_memory = torch.cuda.memory_reserved(device)
-    
-    free_memory = total_memory - (allocated_memory + cached_memory)
-    
-    print(f"Allocated memory: {allocated_memory / 1024**2:.2f} MB")
-    print(f"Cached memory: {cached_memory / 1024**2:.2f} MB")
-    print(f"Free memory: {free_memory / 1024**2:.2f} MB")
-    print(f"=====================================================\n")
-    
 
 def _fill_labels_by_nearest_neighbor(points: np.ndarray, labels: Optional[np.ndarray]) -> Optional[np.ndarray]:
     if labels is None:
@@ -185,7 +162,7 @@ def adaptive_iteration_count(
 
 
 class LayerPano:
-    def __init__(self, save_dir=None, backend="legacy", mps_rasterizer="cpp", quality="standard", max_points=None, downsample_ratio=0.1, training_image_size=None, layer_iterations=800, background_iterations=1000, sky_iterations=500, disable_transfer=False, no_adaptive=False, repulsion_weight=1e-4, mean_lr_scale=1.0, mode="standard", early_stop_patience=None, early_stop_min_delta=0.0, lr_plateau_patience=None, lr_plateau_factor=0.5, lr_plateau_min_lr=1e-6, total_gaussian_budget=0, min_gaussians_per_layer=10_000, adaptive_iterations=False, iteration_reference_points=500_000, iteration_min_scale=0.5, iteration_max_scale=1.25):
+    def __init__(self, save_dir=None, backend="legacy", mps_rasterizer="cpp", quality="standard", max_points=None, downsample_ratio=0.1, training_image_size=None, layer_iterations=800, background_iterations=1000, sky_iterations=500, disable_transfer=False, no_adaptive=False, repulsion_weight=1e-4, mean_lr_scale=1.0, mode="standard", early_stop_patience=None, early_stop_min_delta=0.0, lr_plateau_patience=None, lr_plateau_factor=0.5, lr_plateau_min_lr=1e-6, total_gaussian_budget=0, min_gaussians_per_layer=10_000, adaptive_iterations=False, iteration_reference_points=500_000, iteration_min_scale=0.5, iteration_max_scale=1.25, min_gaussian_retention=0.0):
         self.init_logger()
         self.save_dir = save_dir
         self.opt = GSParams()
@@ -216,6 +193,7 @@ class LayerPano:
         self.iteration_reference_points = int(iteration_reference_points)
         self.iteration_min_scale = float(iteration_min_scale)
         self.iteration_max_scale = float(iteration_max_scale)
+        self.min_gaussian_retention = float(min_gaussian_retention or 0.0)
         
         # Device selection: CUDA > MPS > CPU
         if torch.cuda.is_available():
@@ -276,6 +254,7 @@ class LayerPano:
         print('Outlier Thresh', self.outlier_thresh)
 
         quality_iteration_scale = {
+            "low": 0.5,
             "standard": 1.0,
             "high": 1.5,
             "ultra": 2.0,
@@ -312,7 +291,7 @@ class LayerPano:
                     device=self.device,
                     adaptive=(not self.no_adaptive),
                     max_points=self.max_points,
-                    downsample_ratio=self.downsample_ratio,
+                    downsample_ratio=1.0,  # Already sampled by load_pcd_and_perspectives.
                     repulsion_weight=self.repulsion_weight,
                     mean_lr_scale=self.mean_lr_scale,
                     early_stop_patience=self.early_stop_patience,
@@ -420,6 +399,7 @@ class LayerPano:
         print("Instance layers:", layer_order)
 
         quality_iteration_scale = {
+            "low": 0.5,
             "standard": 1.0,
             "high": 1.5,
             "ultra": 2.0,
@@ -451,12 +431,19 @@ class LayerPano:
         for layer_idx in layer_order:
             layer_started = time.perf_counter()
             layer_cap = layer_budgets.get(layer_idx)
-            if self.max_points is not None and int(self.max_points) > 0:
-                layer_cap = (
-                    int(self.max_points)
-                    if layer_cap is None
-                    else min(int(self.max_points), int(layer_cap))
-                )
+            if self.max_points is not None:
+                configured_cap = int(self.max_points)
+                if configured_cap <= 0 and layer_cap is None:
+                    # Preserve the explicit unlimited sentinel. Converting 0
+                    # to None here used to reactivate the backend's implicit
+                    # per-layer default cap.
+                    layer_cap = 0
+                elif configured_cap > 0:
+                    layer_cap = (
+                        configured_cap
+                        if layer_cap is None
+                        else min(configured_cap, int(layer_cap))
+                    )
             original_max_points = self.max_points
             self.max_points = layer_cap
             try:
@@ -509,7 +496,7 @@ class LayerPano:
                         device=self.device,
                         adaptive=(not self.no_adaptive),
                         max_points=layer_cap,
-                        downsample_ratio=self.downsample_ratio,
+                        downsample_ratio=1.0,  # Already sampled by load_pcd_and_perspectives.
                         repulsion_weight=self.repulsion_weight,
                         mean_lr_scale=self.mean_lr_scale,
                         early_stop_patience=self.early_stop_patience,
@@ -521,6 +508,16 @@ class LayerPano:
                         prev_gaussian_labels=None,
                         training_profile="layer_instances",
                     )
+                if self.no_adaptive and self.min_gaussian_retention > 0.0:
+                    input_count = int(len(self.traindata.get("pcd_points", [])))
+                    output_count = int(_ply_vertex_count(outfile))
+                    retention = output_count / max(1, input_count)
+                    if retention < self.min_gaussian_retention:
+                        raise RuntimeError(
+                            f"Layer {layer_idx} retained only {retention:.2%} of "
+                            f"its Gaussian support ({output_count:,}/{input_count:,}); "
+                            "the run is rejected to prevent a low-coverage result."
+                        )
                 output_paths.append(outfile)
                 print(
                     f"[timing] layer={layer_idx} iterations={n_iterations} "

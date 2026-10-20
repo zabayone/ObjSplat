@@ -224,23 +224,37 @@ def resolve_scene_context(input_path: Path) -> tuple[Path, Path, Path | None]:
     scene_root: Path | None = None
 
     if input_path.is_dir():
-        if (input_path / "scene" / "moods.json").exists():
+        if (input_path / "scene").is_dir():
             scene_root = input_path
-            manifest_path = input_path / "scene" / "moods.json"
-        elif input_path.name == "scene" and (input_path / "moods.json").exists():
+            scene_dir = input_path / "scene"
+        elif input_path.name == "scene":
             scene_root = input_path.parent
-            manifest_path = input_path / "moods.json"
+            scene_dir = input_path
         else:
             raise FileNotFoundError(
-                f"Directory does not contain scene/moods.json: {input_path}"
+                f"Directory does not contain an ObjSplat scene/: {input_path}"
             )
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        moods = manifest.get("moods") or {}
-        active_name = str(manifest.get("active_mood") or "day")
-        active_entry = moods.get(active_name) or moods.get("day")
-        if not active_entry or not active_entry.get("ply_path"):
-            raise ValueError(f"Mood manifest has no loadable active mood: {manifest_path}")
-        ply_path = (scene_root / str(active_entry["ply_path"])).resolve()
+        candidate_manifest = scene_dir / "moods.json"
+        if candidate_manifest.exists():
+            manifest_path = candidate_manifest
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            moods = manifest.get("moods") or {}
+            active_name = str(manifest.get("active_mood") or "day")
+            active_entry = moods.get(active_name) or moods.get("day")
+            if not active_entry or not active_entry.get("ply_path"):
+                raise ValueError(f"Mood manifest has no loadable active mood: {manifest_path}")
+            ply_path = (scene_root / str(active_entry["ply_path"])).resolve()
+        else:
+            candidates = [
+                scene_dir / "gsplat_scene_merged_refined.ply",
+                scene_dir / "gsplat_scene_merged.ply",
+                scene_dir / "gsplat_scene_monolithic.ply",
+            ]
+            ply_path = next((path for path in candidates if path.exists()), None)
+            if ply_path is None:
+                ply_path = next(iter(sorted(scene_dir.glob("gsplat_scene_*.ply"))), None)
+            if ply_path is None:
+                raise FileNotFoundError(f"No scene PLY found in {scene_dir}")
     else:
         ply_path = input_path
         if ply_path.parent.name == "scene":
@@ -264,7 +278,7 @@ def resolve_scene_context(input_path: Path) -> tuple[Path, Path, Path | None]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Open a PLY or mood-enabled ObjSplat scene in SuperSplat."
+        description="Open a PLY or ObjSplat scene in SuperSplat."
     )
     parser.add_argument(
         "scene_path",

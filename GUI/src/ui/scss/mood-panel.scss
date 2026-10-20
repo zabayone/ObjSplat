@@ -76,10 +76,20 @@
 }
 
 .mood-panel-coordinates {
-    display: flex;
-    justify-content: space-between;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 4px;
     margin-bottom: 8px;
     color: $text-secondary;
+    font-size: 10px;
+
+    span:nth-child(2) {
+        text-align: center;
+    }
+
+    span:last-child {
+        text-align: right;
+    }
 
     strong {
         color: #fff;
@@ -100,7 +110,7 @@
 .mood-slider-row,
 .mood-time-row {
     display: grid;
-    grid-template-columns: 56px 1fr;
+    grid-template-columns: 68px 1fr;
     gap: 8px;
     align-items: center;
     margin-top: 8px;

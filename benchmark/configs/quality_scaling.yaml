@@ -1,0 +1,80 @@
+experiment_name: layered_quality_scaling
+output_root: benchmark_results
+python_executable: /opt/anaconda3/envs/layerpano3d/bin/python
+
+# One indoor scene containing the previously unstable small-object layer and
+# one challenging outdoor scene keep the sweep computationally manageable
+# while covering both scene classes. Iterations stay fixed; only the fraction
+# of the common full-resolution 3D support used for training changes.
+shared_preprocessing_root_template: benchmark_work/evaluation_main/{scene}
+scenes:
+  - name: indoor_3
+    scene_root: benchmark_work/quality_scaling_unused/indoor_3
+    input_panorama: benchmark/evaluation/indoor_3.jpg
+  - name: outdoor_1
+    scene_root: benchmark_work/quality_scaling_unused/outdoor_1
+    input_panorama: benchmark/evaluation/outdoor_1.jpg
+
+ablations:
+  - name: low
+    quality: low
+    scene_root_template: benchmark_work/quality_scaling/{scene}/low
+    pipeline_args: [--quality, standard, --downsample_ratio, "0.25"]
+  - name: standard
+    quality: standard
+    scene_root_template: benchmark_work/quality_scaling/{scene}/standard
+    pipeline_args: [--quality, standard, --downsample_ratio, "0.50"]
+  - name: high
+    quality: high
+    scene_root_template: benchmark_work/quality_scaling/{scene}/high
+    pipeline_args: [--quality, standard, --downsample_ratio, "0.75"]
+  - name: ultra
+    quality: ultra
+    scene_root_template: benchmark_work/quality_scaling/{scene}/ultra
+    pipeline_args: [--quality, standard, --downsample_ratio, "1.00"]
+
+rerun_segmentation: false
+retrain: true
+reuse_existing_outputs: true
+reuse_requires_scene_artifacts: true
+run_monolithic_baseline: true
+run_quality_evaluation: false
+run_rendering_benchmark: false
+run_edit_locality: false
+run_mood_evaluation: false
+fail_fast: false
+random_seed: 42
+resource_sampling_interval: 1.0
+
+monolithic:
+  iterations: 1000
+  image_size: 640
+  rasterizer: cpp
+  adaptive_topology: false
+  max_points: 0
+
+splits:
+  training_fraction: 0.8
+  evaluation_fraction: 0.2
+
+pipeline_args:
+  - --device
+  - mps
+  - --mps_rasterizer
+  - cpp
+  - --max_points
+  - "0"
+  - --downsample_ratio
+  - "1.0"
+  - --training_image_size
+  - "640"
+  - --layer_iterations
+  - "800"
+  - --background_iterations
+  - "1000"
+  - --sky_iterations
+  - "500"
+  - --global_refine_iters
+  - "0"
+  - --min_gaussian_retention
+  - "0.95"

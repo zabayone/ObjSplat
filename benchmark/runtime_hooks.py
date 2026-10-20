@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from benchmark.instrumentation.resources import memory_snapshot
+from benchmark.instrumentation.resources import ResourceSampler, memory_snapshot
 from benchmark.io_utils import append_csv
 from benchmark.schemas import STAGE_COLUMNS
 
@@ -48,7 +48,17 @@ def pipeline_stage(name: str, **counters):
         yield
         return
     parent = _STACK[-1] if _STACK else None
+    is_root = not _STACK
     _STACK.append(name)
+    sampler = None
+    if is_root:
+        sampler = ResourceSampler(
+            Path(os.environ["OBJSPLAT_BENCHMARK_DIR"]) / "resource_samples.csv",
+            _base(),
+            interval=float(os.environ.get("OBJSPLAT_BENCHMARK_INTERVAL", "1.0")),
+            stage_getter=lambda: (_STACK[0] if _STACK else name),
+        )
+        sampler.start()
     wall_start, cpu_start = time.perf_counter(), time.process_time()
     before = memory_snapshot()
     started_at = datetime.now(timezone.utc).isoformat()
@@ -60,6 +70,8 @@ def pipeline_stage(name: str, **counters):
         raise
     finally:
         after = memory_snapshot()
+        if sampler is not None:
+            sampler.stop()
         row = {
             **_base(), "stage": name, "parent_stage": parent,
             "started_at": started_at, "ended_at": datetime.now(timezone.utc).isoformat(),
@@ -69,6 +81,9 @@ def pipeline_stage(name: str, **counters):
             "rss_after_bytes": after.get("process_rss_bytes"),
             "system_available_before_bytes": before.get("system_available_bytes"),
             "system_available_after_bytes": after.get("system_available_bytes"),
+            "peak_sampled_rss_bytes": (
+                sampler.peak_rss_by_stage.get(name) if sampler is not None else None
+            ),
             "exception_type": exc_type, "exception_message": exc_message, **counters,
         }
         _add_rates(row)

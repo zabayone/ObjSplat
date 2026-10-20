@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import json
 import math
 import os
@@ -47,8 +48,10 @@ def append_csv(path: str | Path, row: dict[str, Any], columns: Iterable[str]) ->
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     columns = list(columns)
-    exists = path.exists() and path.stat().st_size > 0
     with path.open("a", newline="", encoding="utf-8") as handle:
+        # Parent recorder and child training hooks share these CSVs.
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        exists = os.fstat(handle.fileno()).st_size > 0
         writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
         if not exists:
             writer.writeheader()

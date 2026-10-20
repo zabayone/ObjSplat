@@ -57,7 +57,6 @@ class BenchmarkRecorder:
         cpu_start = time.process_time()
         before = memory_snapshot()
         self._stack.append(name)
-        peak_before = self.sampler.peak_rss
         status = "success"
         exc_type = exc_message = None
         try:
@@ -81,7 +80,9 @@ class BenchmarkRecorder:
                 "rss_after_bytes": after.get("process_rss_bytes"),
                 "system_available_before_bytes": before.get("system_available_bytes"),
                 "system_available_after_bytes": after.get("system_available_bytes"),
-                "peak_sampled_rss_bytes": max(0, self.sampler.peak_rss, peak_before),
+                "peak_sampled_rss_bytes": (
+                    self.sampler.peak_rss_by_stage.get(name) or None
+                ),
                 "exception_type": exc_type, "exception_message": exc_message,
                 **counters,
             }

@@ -14,13 +14,14 @@ from benchmark.editing_evaluation import resolve_layer_selectors
 from benchmark.instrumentation import BenchmarkRecorder
 from benchmark.input_preparation import prepare_panorama
 from benchmark.instrumentation.resources import ResourceSampler
-from benchmark.io_utils import read_csv
+from benchmark.io_utils import read_csv, write_csv
 from benchmark.metrics.editing import edit_locality_metrics
 from benchmark.metrics.image_metrics import mae, psnr
 from benchmark.metrics.mood import compare_topology
 from benchmark.metrics.segmentation import mask_metrics
 from benchmark.ply_utils import inspect_ply
 from benchmark.reporting import aggregate_results, generate_report
+from benchmark.schemas import COMPARISON_COLUMNS
 from benchmark.system_info import collect_system_info
 from benchmark.run_benchmark import (
     _find_reusable_run,
@@ -28,7 +29,7 @@ from benchmark.run_benchmark import (
     _run_fingerprint,
     expand_scenes,
 )
-from mps_splat_backend import _balanced_camera_indices
+from mps_splat_backend import _balanced_camera_indices, _save_layerpano_compatible_ply_mlx
 from LayerPano import adaptive_iteration_count, allocate_gaussian_budgets
 
 
@@ -109,6 +110,28 @@ class MetricTests(unittest.TestCase):
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_nonfinite_gaussians_are_repaired_without_coverage_loss(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "repaired.ply"
+            means = np.array([[0, 0, 1], [np.nan, 1, 1]], np.float32)
+            fallback = np.array([[0, 0, 1], [1, 1, 1]], np.float32)
+            params = {
+                "means": means,
+                "scales": np.array([[-2, -2, -2], [np.nan, -2, -2]], np.float32),
+                "quaternions": np.array([[1, 0, 0, 0], [np.nan, 0, 0, 0]], np.float32),
+                "opacities": np.array([[0], [np.nan]], np.float32),
+                "sh_coeffs": np.zeros((2, 16, 3), np.float32),
+            }
+            params["sh_coeffs"][1, 0, 0] = np.nan
+            _save_layerpano_compatible_ply_mlx(
+                str(path), params, np.array([0, 1]), fallback_xyz=fallback
+            )
+            vertex = PlyData.read(path)["vertex"].data
+            self.assertEqual(len(vertex), 2)
+            for name in vertex.dtype.names:
+                if vertex.dtype[name].kind == "f":
+                    self.assertTrue(np.isfinite(vertex[name]).all())
+
     def test_ply_inspection(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tiny.ply"
@@ -140,6 +163,42 @@ class ArtifactTests(unittest.TestCase):
 
 
 class ConfigAndReportTests(unittest.TestCase):
+    def test_quality_scaling_compares_each_scene_to_its_standard_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "experiment"
+            for quality, layered_values, monolithic_values in (
+                ("low", (50, 300), (80, 500)),
+                ("standard", (100, 400), (160, 600)),
+            ):
+                run = root / f"scene__{quality}" / "run"
+                run.mkdir(parents=True)
+                (run / "run_summary.json").write_text(json.dumps({"status": "success"}))
+                rows = []
+                for variant, (seconds, memory) in (
+                    ("layered", layered_values),
+                    ("monolithic", monolithic_values),
+                ):
+                    rows.append({
+                        "experiment": "quality",
+                        "scene": f"scene__{quality}",
+                        "base_scene": "scene",
+                        "run_id": quality,
+                        "quality": quality,
+                        "variant": variant,
+                        "training_time_seconds": seconds,
+                        "peak_training_rss_bytes": memory,
+                        "downsample_ratio": 0.25 if quality == "low" else 0.5,
+                    })
+                write_csv(run / "comparison_metrics.csv", rows, COMPARISON_COLUMNS)
+            output = Path(directory) / "report"
+            aggregate_results(root, output)
+            rows = {row["quality"]: row for row in read_csv(output / "quality_scaling.csv")}
+            self.assertEqual(float(rows["standard"]["layered_time_change_vs_standard_percent"]), 0)
+            self.assertEqual(float(rows["low"]["layered_time_change_vs_standard_percent"]), -50)
+            self.assertEqual(float(rows["low"]["layered_memory_change_vs_standard_percent"]), -25)
+            self.assertEqual(float(rows["low"]["layered_speedup_percent"]), 37.5)
+            self.assertEqual(float(rows["low"]["layered_peak_memory_reduction_percent"]), 40)
+
     def test_configuration_validation(self):
         with self.assertRaises(ValueError):
             validate_config({"experiment_name": "", "scenes": []})

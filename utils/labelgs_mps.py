@@ -52,13 +52,14 @@ def write_layerpano_compatible_ply(
     scales: np.ndarray,
     rots: np.ndarray,
     labels: Optional[np.ndarray] = None,
+    normalize_rotations: bool = True,
 ) -> None:
     N = xyz.shape[0]
     dtype_list = []
     arrays = {}
 
     rots_np = np.asarray(rots, dtype=np.float32)
-    if rots_np.ndim == 2 and rots_np.shape[1] == 4:
+    if normalize_rotations and rots_np.ndim == 2 and rots_np.shape[1] == 4:
         norms = np.linalg.norm(rots_np, axis=1, keepdims=True)
         norms = np.where(norms < 1e-8, 1.0, norms)
         rots_np = rots_np / norms

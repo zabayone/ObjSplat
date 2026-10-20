@@ -331,7 +331,7 @@ def main() -> None:
 
     parser.add_argument("--outlier_thresh", type=int, default=3)
     parser.add_argument("--mps_rasterizer", type=str, default="cpp", choices=["python", "cpp"])
-    parser.add_argument("--quality", type=str, default="standard", choices=["standard", "high", "ultra", "test"])
+    parser.add_argument("--quality", type=str, default="standard", choices=["low", "standard", "high", "ultra", "test"])
     parser.add_argument("--max_points", type=int, default=0,
                         help="Per-layer gaussian cap; <=0 disables the cap")
     parser.add_argument(
@@ -345,6 +345,15 @@ def main() -> None:
         type=int,
         default=10000,
         help="Minimum allocation used with --total_gaussian_budget",
+    )
+    parser.add_argument(
+        "--min_gaussian_retention",
+        type=float,
+        default=0.0,
+        help=(
+            "Reject non-adaptive layer training if the exported Gaussian count "
+            "falls below this fraction of its input support; 0 disables the guard"
+        ),
     )
     parser.add_argument("--downsample_ratio", type=float, default=1.0)
     parser.add_argument(
@@ -806,6 +815,7 @@ def main() -> None:
         iteration_reference_points=args.iteration_reference_points,
         iteration_min_scale=args.iteration_min_scale,
         iteration_max_scale=args.iteration_max_scale,
+        min_gaussian_retention=args.min_gaussian_retention,
         mode="layer_instances",
     )
 

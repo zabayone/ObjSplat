@@ -18,16 +18,34 @@ if __package__ in (None, ""):
 import numpy as np
 
 from benchmark.config import load_config
+from benchmark.comparison import write_comparison_metrics
 from benchmark.evaluation import benchmark_rendering, evaluate_reconstruction
 from benchmark.editing_evaluation import evaluate_editing, resolve_layer_selectors
 from benchmark.instrumentation import BenchmarkRecorder
 from benchmark.input_preparation import file_sha256, prepare_panorama
 from benchmark.io_utils import atomic_json
-from benchmark.io_utils import write_csv
+from benchmark.io_utils import write_csv, read_csv
+from benchmark.validation import validate_view_split
 from benchmark.reporting import aggregate_results
 from benchmark.scene_analysis import analyse_existing_scene
 from benchmark.system_info import collect_system_info
 from benchmark.schemas import EDITING_COLUMNS, RECONSTRUCTION_COLUMNS, RENDERING_COLUMNS
+
+
+def _code_fingerprint(repo: Path) -> str:
+    """Hash tracked and untracked source contents, including dirty working files."""
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        check=True, capture_output=True,
+    ).stdout.decode().split("\0")
+    digest = hashlib.sha256()
+    for name in sorted(set(listed)):
+        path = repo / name
+        if path.suffix not in {".py", ".sh", ".yaml", ".json", ".cpp", ".h", ".mm", ".metal"} or not path.is_file():
+            continue
+        digest.update(name.encode() + b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def _run_fingerprint(config: dict, scene: dict) -> str:
@@ -50,11 +68,19 @@ def _run_fingerprint(config: dict, scene: dict) -> str:
                 "size_bytes": source_stat.st_size,
                 "sha256": file_sha256(panorama_path),
             }
+    preprocessing_identity = {}
+    preprocessing_root = Path(scene.get("shared_preprocessing_root") or scene.get("scene_root", "."))
+    for relative in ("input_preparation.json", "traindata/layer_instances.json"):
+        artifact = preprocessing_root / relative
+        if artifact.exists():
+            preprocessing_identity[relative] = file_sha256(artifact)
     payload = json.dumps(
         {
             "config": stable_config,
             "scene": scene,
             "input_panorama": panorama_identity,
+            "preprocessing": preprocessing_identity,
+            "code_sha256": _code_fingerprint(Path(__file__).resolve().parents[1]),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -155,6 +181,15 @@ def _pipeline_command(config: dict, scene: dict, repo: Path) -> list[str]:
     return command
 
 
+def _pipeline_arg_value(config: dict, scene: dict, flag: str, default: str) -> str:
+    args = list(config.get("pipeline_args", [])) + list(scene.get("pipeline_args", []))
+    value = default
+    for index, item in enumerate(args[:-1]):
+        if str(item) == flag:
+            value = str(args[index + 1])
+    return value
+
+
 def _variants(scene_root: Path) -> dict[str, Path]:
     candidates = {
         "layered": scene_root / "scene" / "gsplat_scene_merged.ply",
@@ -218,19 +253,6 @@ def run_scene(
     output = experiment_root / name / run_id
     panorama = scene.get("input_panorama")
     shared_preprocessing = scene.get("shared_preprocessing_root")
-    if shared_preprocessing:
-        _link_shared_preprocessing(scene_root, Path(shared_preprocessing))
-    elif panorama:
-        preprocessing = dict(config.get("input_preprocessing") or {})
-        preprocessing.update(scene.get("input_preprocessing") or {})
-        prepare_panorama(
-            panorama,
-            scene_root,
-            target_width=preprocessing.get("target_width"),
-            require_equirectangular_2_to_1=bool(
-                preprocessing.get("require_equirectangular_2_to_1", True)
-            ),
-        )
     recorder = BenchmarkRecorder(
         output, config["experiment_name"], name,
         run_id=run_id,
@@ -261,18 +283,52 @@ def run_scene(
     status = "success"
     recorder.start()
     try:
+        benchmark_env = os.environ.copy()
+        benchmark_env.update({
+            "OBJSPLAT_BENCHMARK_DIR": str(output),
+            "OBJSPLAT_BENCHMARK_EXPERIMENT": config["experiment_name"],
+            "OBJSPLAT_BENCHMARK_SCENE": name,
+            "OBJSPLAT_BENCHMARK_RUN_ID": recorder.run_id,
+            "OBJSPLAT_BENCHMARK_INTERVAL": str(config["resource_sampling_interval"]),
+            "PYTHONHASHSEED": str(config["random_seed"]),
+        })
+        if shared_preprocessing:
+            _link_shared_preprocessing(scene_root, Path(shared_preprocessing))
+            manifest = json.loads((scene_root / "input_preparation.json").read_text())
+            if panorama and manifest.get("source_sha256") != file_sha256(Path(panorama)):
+                raise ValueError("Shared preprocessing belongs to a different input panorama")
+        elif panorama:
+            preprocessing = dict(config.get("input_preprocessing") or {})
+            preprocessing.update(scene.get("input_preprocessing") or {})
+            prepare_panorama(
+                panorama,
+                scene_root,
+                target_width=preprocessing.get("target_width"),
+                require_equirectangular_2_to_1=bool(
+                    preprocessing.get("require_equirectangular_2_to_1", True)
+                ),
+            )
+        if (scene_root / "traindata" / "layer_instances.json").exists() and not config.get("rerun_segmentation"):
+            with recorder.stage("validate_existing_view_split"):
+                validate_view_split(
+                    scene_root,
+                    evaluation_fraction=float(config.get("splits", {}).get("evaluation_fraction", 0.2)),
+                    seed=int(config.get("random_seed", 42)),
+                    require_held_out=bool(config.get("run_quality_evaluation")),
+                )
         if config.get("rerun_segmentation") or config.get("retrain"):
             command = _pipeline_command(config, scene, repo)
-            env = os.environ.copy()
-            env.update({
-                "OBJSPLAT_BENCHMARK_DIR": str(output),
-                "OBJSPLAT_BENCHMARK_EXPERIMENT": config["experiment_name"],
-                "OBJSPLAT_BENCHMARK_SCENE": name,
-                "OBJSPLAT_BENCHMARK_RUN_ID": recorder.run_id,
-                "PYTHONHASHSEED": str(config["random_seed"]),
-            })
             with recorder.stage("complete_end_to_end"):
-                subprocess.run(command, cwd=repo, env=env, check=True)
+                subprocess.run(command, cwd=repo, env=benchmark_env, check=True)
+        if config.get("run_quality_evaluation") or config.get("retrain"):
+            with recorder.stage("validate_view_split"):
+                split_cfg = config.get("splits", {})
+                validate_view_split(
+                    scene_root,
+                    evaluation_fraction=float(split_cfg.get("evaluation_fraction", 0.2)),
+                    seed=int(config.get("random_seed", 42)),
+                    require_held_out=bool(config.get("run_quality_evaluation")),
+                )
         with recorder.stage("existing_scene_analysis"):
             summary = analyse_existing_scene(
                 scene_root, output, context,
@@ -281,6 +337,8 @@ def run_scene(
             )
             recorder.summary.update(summary)
         variants = _variants(scene_root)
+        if "layered" not in variants:
+            raise RuntimeError("Missing merged layered scene")
         selected_layers = resolve_layer_selectors(
             scene_root, config.get("selected_layers", [])
         )
@@ -295,13 +353,24 @@ def run_scene(
                 "--image_size", str(baseline_cfg.get("image_size", 640)),
                 "--rasterizer", str(baseline_cfg.get("rasterizer", "cpp")),
                 "--max_points", str(baseline_cfg.get("max_points", 0)),
+                "--downsample_ratio", _pipeline_arg_value(
+                    config, scene, "--downsample_ratio", "1.0"
+                ),
                 "--seed", str(config.get("random_seed", 42)),
             ]
             if baseline_cfg.get("adaptive_topology"):
                 command.append("--adaptive")
             with recorder.stage("monolithic_baseline", iterations=baseline_cfg.get("iterations", 1000)):
-                subprocess.run(command, cwd=repo, check=True)
+                subprocess.run(command, cwd=repo, env=benchmark_env, check=True)
             variants = _variants(scene_root)
+        if config.get("retrain"):
+            # Existing optional PLYs may belong to an older configuration.
+            if not config.get("run_monolithic_baseline"):
+                variants.pop("monolithic", None)
+            if int(_pipeline_arg_value(config, scene, "--global_refine_iters", "0")) <= 0:
+                variants.pop("refined", None)
+            if not config.get("run_mood_evaluation"):
+                variants.pop("night", None)
         if config.get("run_quality_evaluation"):
             with recorder.stage("reconstruction_evaluation"):
                 for variant, ply in variants.items():
@@ -339,7 +408,7 @@ def run_scene(
     except Exception as exc:
         status = "partial_success" if (output / "layer_metrics.csv").exists() else "failed"
         failures.append({
-            "scene": name, "failed_stage": recorder.current_stage,
+            "scene": name, "failed_stage": recorder.summary.get("failed_stage") or recorder.current_stage,
             "exception_type": type(exc).__name__, "exception_message": str(exc),
             "traceback": traceback.format_exc(),
         })
@@ -347,6 +416,38 @@ def run_scene(
         if config.get("fail_fast"):
             raise
     finally:
+        # Freeze the resource trace before deriving stage-local comparison rows.
+        recorder.stop()
+        try:
+            comparison = write_comparison_metrics(scene_root, output, context, config, scene)
+            incomplete = [row for row in comparison if row.get("status") != "success"]
+            for filename, enabled in (
+                ("reconstruction_metrics.csv", config.get("run_quality_evaluation")),
+                ("rendering_metrics.csv", config.get("run_rendering_benchmark")),
+                ("editing_metrics.csv", config.get("run_edit_locality")),
+            ):
+                rows = read_csv(output / filename)
+                if enabled and (not rows or any(row.get("status") != "success" for row in rows)):
+                    incomplete.append({"reason": f"Incomplete {filename}"})
+            if incomplete and status == "success":
+                status = "partial_success"
+                failures.append({"scene": name, "failed_stage": "metric_validation",
+                                 "exception_message": "; ".join(str(row.get("reason")) for row in incomplete)})
+                atomic_json(output / "failures.json", failures)
+        except Exception as comparison_exc:
+            if status == "success":
+                status = "partial_success"
+            failures.append({
+                "scene": name,
+                "failed_stage": "comparison_summary",
+                "exception_type": type(comparison_exc).__name__,
+                "exception_message": str(comparison_exc),
+            })
+            atomic_json(output / "failures.json", failures)
+        saved_config = output / "experiment_config.json"
+        saved = json.loads(saved_config.read_text())
+        saved["run_fingerprint"] = _run_fingerprint(config, scene)
+        atomic_json(saved_config, saved)
         recorder.summary["outputs_successfully_generated"] = [
             str(path.relative_to(output)) for path in output.rglob("*") if path.is_file()
         ]
@@ -358,8 +459,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run reproducible ObjSplat benchmarks")
     parser.add_argument(
         "--config",
-        default=str(Path(__file__).resolve().parent / "configs" / "scientific_core.yaml"),
-        help="Benchmark config (defaults to the scientific core protocol)",
+        default=str(Path(__file__).resolve().parent / "configs" / "layered_vs_monolithic_six_scenes.yaml"),
+        help="Benchmark config (defaults to the six-scene layered/monolithic protocol)",
     )
     parser.add_argument(
         "--force",
@@ -413,9 +514,10 @@ def main() -> None:
                 run_fingerprint=fingerprint,
             )
         )
+    atomic_json(experiment_root / "selected_runs.json", results)
     aggregate_results(experiment_root, experiment_root / "report")
     print(json.dumps(results, indent=2))
-    if any(row["status"] == "failed" for row in results):
+    if any(row["status"] != "success" for row in results):
         raise SystemExit(1)
 
 

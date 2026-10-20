@@ -6,18 +6,17 @@ tables, resource traces, PNG/PDF thesis plots, and a Markdown report.
 
 ## Quick commands
 
-Run the default scientifically scoped six-scene protocol:
+Run the default six-scene layered-versus-monolithic protocol:
 
 ```bash
 /opt/anaconda3/envs/layerpano3d/bin/python benchmark/run_benchmark.py
 ```
 
-This uses `benchmark/configs/scientific_core.yaml`: a deterministic 80/20
-held-out split, a matched monolithic baseline, a four-million-Gaussian cap,
-adaptive layer iterations, short global refinement, full-scene rendering, and
-small/median/large object-removal targets. It is intentionally expensive.
-`lpips` is declared in `requirements.txt`; if it is absent from an older
-environment, the report marks LPIPS as `n/a` instead of inventing a value.
+This uses `benchmark/configs/layered_vs_monolithic_six_scenes.yaml`. It retrains
+the layered and matched monolithic representations from identical cached depth,
+masks, point clouds, training views, and held-out views. It reports PSNR, SSIM,
+LPIPS, MAE, training time, stage-local peak RSS, Gaussian/PLY size, and rendering
+performance. Editing, retexturing, and mood evaluation are deliberately excluded.
 
 Run the inexpensive existing-output smoke test:
 
@@ -48,29 +47,47 @@ For multiple scenes, edit and run:
   --config benchmark/configs/thesis_benchmark.yaml
 ```
 
-Run the prepared six-scene suite (three indoor and three outdoor ERP images):
+Run the complete prepared suite:
 
 ```bash
 bash benchmark/run_evaluation_suite.sh
 ```
 
-This runs the matched complete protocol on all six scenes, then focused
-one-factor-at-a-time ablations on `indoor_1` and `outdoor_1`. The ablations
-reuse immutable depth, masks, point clouds, and perspective frames from the
-main run; only training-dependent artifacts remain isolated. To run only the
-main six-scene experiment:
+This runs the matched standard-quality protocol on all six scenes, then a
+four-level quality sweep on one indoor and one outdoor scene. Depth, masks, point clouds and
+perspective frames remain immutable; only training outputs are isolated.
+
+To run only the six-scene comparison:
 
 ```bash
 /opt/anaconda3/envs/layerpano3d/bin/python benchmark/run_benchmark.py \
-  --config benchmark/configs/evaluation_six_scenes.yaml
+  --config benchmark/configs/layered_vs_monolithic_six_scenes.yaml
 ```
+
+To measure how layered training time and peak memory scale with training-support
+resolution (`low`, `standard`, `high`, `ultra`):
+
+```bash
+/opt/anaconda3/envs/layerpano3d/bin/python benchmark/run_benchmark.py \
+  --config benchmark/configs/quality_scaling.yaml
+```
+
+The quality sweep uses `indoor_3` and `outdoor_1`, retaining indoor/outdoor
+coverage without repeating 24 costly trainings. Every level uses the same
+object/background/sky iteration counts; only the fraction of the common 4096×2048
+ERP-derived 3D support changes: 0.25×, 0.50×, 0.75×, and 1.00×. Segmentation,
+views, split, training-image size and backend stay fixed. Training time and peak
+RSS are measured for both layered and monolithic training at every level. The
+report exposes their paired speed-up/memory reduction as well as changes from
+the `standard` (0.50×) run of the same scene, without averaging different scenes
+before the comparison.
 
 Successful runs with the same resolved scientific configuration are reused.
 Pass `--force` when a genuinely independent rerun is required:
 
 ```bash
 /opt/anaconda3/envs/layerpano3d/bin/python benchmark/run_benchmark.py \
-  --config benchmark/configs/evaluation_six_scenes.yaml --force
+  --config benchmark/configs/layered_vs_monolithic_six_scenes.yaml --force
 ```
 
 Regenerate aggregate tables, statistics, plots, and the report without rerunning
@@ -80,6 +97,14 @@ the pipeline:
 /opt/anaconda3/envs/layerpano3d/bin/python benchmark/aggregate_results.py \
   --input benchmark_results/thesis_multi_scene \
   --output benchmark_results/thesis_multi_scene/report
+```
+
+Populate missing LPIPS values from reconstruction PNGs that were already
+rendered, without segmentation, rendering, or retraining:
+
+```bash
+/opt/anaconda3/envs/layerpano3d/bin/python benchmark/backfill_lpips.py \
+  --experiment benchmark_results/evaluation_six_scenes_complete
 ```
 
 ## Output layout
@@ -96,6 +121,8 @@ layer_metrics.csv         one row per semantic/background/residual layer
 segmentation_metrics.csv  intrinsic rows and optional ground-truth rows
 reconstruction_metrics.csv
 rendering_metrics.csv
+comparison_metrics.csv     one row per scene/quality/representation
+quality_scaling.csv        per-scene quality deltas relative to standard
 editing_metrics.csv
 mood_metrics.csv
 failures.json             created when a stage fails
@@ -227,9 +254,16 @@ often before any view is repeated. Python, NumPy, Torch, and MLX share the
 configured seed. LPIPS keeps one AlexNet instance per process rather than
 reloading it for every held-out image.
 
-On Apple Silicon, process RSS includes the benchmark process and subprocess
-tree, while system available/used/swap values reflect unified memory. They are
-estimates and must not be described as dedicated GPU VRAM.
+On Apple Silicon, process RSS includes the measured process tree, while system
+available/used/swap values reflect unified memory. The comparison table uses
+the peak sampled specifically during `all_layer_training` or
+`monolithic_training_process`, rather than the global peak of the complete run. These
+values are estimates and must not be described as dedicated GPU VRAM.
+
+Non-adaptive benchmark runs set `--max_points 0` (no implicit per-layer cap)
+and `--min_gaussian_retention 0.95`. Non-finite learned attributes are repaired
+with finite coverage-preserving fallbacks at export; a run is rejected if a
+layer still retains less than 95% of its input Gaussian support.
 
 ## Stable CSV schemas
 

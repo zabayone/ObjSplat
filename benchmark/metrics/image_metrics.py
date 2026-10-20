@@ -8,8 +8,9 @@ import numpy as np
 
 
 def _float_image(image) -> np.ndarray:
-    value = np.asarray(image, dtype=np.float32)
-    if value.size and value.max() > 1.0:
+    source = np.asarray(image)
+    value = source.astype(np.float32, copy=True)
+    if source.dtype == np.uint8 or (value.size and value.max() > 1.0):
         value /= 255.0
     return np.clip(value, 0.0, 1.0)
 

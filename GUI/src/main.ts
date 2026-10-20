@@ -265,11 +265,9 @@ const main = async () => {
         }]);
     }
 
-    const moodManifestUrl = url.searchParams.get('moodManifest');
-    const moodRootUrl = url.searchParams.get('moodRoot');
-    if (moodManifestUrl && moodRootUrl) {
+    if (url.searchParams.has('localViewer')) {
         try {
-            await initMoodPanel(events, moodManifestUrl, moodRootUrl);
+            initMoodPanel(events);
         } catch (error) {
             console.error('Unable to initialize ObjSplat mood controls:', error);
         }

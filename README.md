@@ -170,8 +170,9 @@ GroundingDINO + SAM2 remain responsible for the object-aware layers.
 The benchmark can analyse completed outputs or retrain from original ERP images
 with deterministic held-out perspective views. It records system/software
 metadata, stage timings, resource samples, layer and segmentation statistics,
-reconstruction fidelity, rendering speed, edit locality, mood topology, robust
-failure information, aggregate statistics, and thesis-ready plots.
+reconstruction fidelity, rendering speed, robust failure information, aggregate
+statistics, and thesis-ready plots. The default protocol is intentionally scoped
+to layered versus monolithic training.
 
 Analyse an existing scene without retraining:
 
@@ -185,6 +186,10 @@ Run the prepared six-scene indoor/outdoor evaluation suite:
 ```bash
 bash benchmark/run_evaluation_suite.sh
 ```
+
+The suite first compares standard-quality layered and monolithic training on all
+six scenes, then runs a four-level layered quality sweep on one indoor and one
+outdoor scene.
 
 The suite expects local 2:1 ERP files under `benchmark/evaluation/`; these large
 inputs are intentionally ignored by Git. See
@@ -205,9 +210,9 @@ and [benchmark/METHODOLOGY.md](benchmark/METHODOLOGY.md).
 - `utils/semantic_instance_detection.py`: GroundingDINO + SAM/SAM2 detection and mask cleanup.
 - `utils/open_ply_in_supersplat.py`: helper to inspect PLY outputs in SuperSplat.
 - `benchmark/run_benchmark.py`: multi-scene benchmark orchestrator.
-- `benchmark/configs/scientific_core.yaml`: default thesis protocol with a
-  controlled Gaussian budget, paired monolithic baseline, held-out fidelity,
-  multi-size edit targets, rendering, memory, and day/night topology metrics.
+- `benchmark/configs/layered_vs_monolithic_six_scenes.yaml`: default paired
+  six-scene protocol with held-out fidelity, training time/RAM, and rendering.
+- `benchmark/configs/quality_scaling.yaml`: fixed-iteration 0.25×–1.00× training-support sweep.
 - `benchmark/schemas.py`: stable machine-readable CSV schemas.
 - `benchmark/configs/`: smoke, complete, thesis, and ablation configurations.
 - `benchmark/run_evaluation_suite.sh`: six-scene evaluation entry point.
@@ -238,18 +243,17 @@ python utils/open_ply_in_supersplat.py outputs_lgs
 The helper serves real HTTP byte ranges (`206 Partial Content`) and streams
 them in bounded chunks. This avoids SuperSplat's whole-file memory fallback,
 which can exhaust the browser buffer on scenes containing millions of
-Gaussians. When the scene contains `scene/moods.json`, the local viewer also
-shows an ObjSplat mood panel:
+Gaussians. The local viewer always shows the ObjSplat real-time mood matrix:
 
-- drag the valence-arousal pad for immediate whole-scene GPU modulation;
-- use the keyboard-accessible sliders for precise coordinates;
-- filter exact variants by day/night;
-- click a preset to load its precomputed PLY while preserving the camera;
-- use **Load nearest exact mood** to snap a continuous point to the closest
-  generated variant.
+- horizontal movement controls exposure in photographic stops (EV);
+- vertical movement controls contrast through black/white points;
+- the Brightness slider controls additive luminosity independently from exposure;
+- changes are applied immediately to every loaded splat on the GPU;
+- neutral, serene, joyful, tense, melancholic, and night presets move the same
+  three parameters without loading or generating another PLY.
 
-Passing a specific PLY remains supported. If that PLY is inside a mood-enabled
-`scene/` directory, the controls are discovered automatically.
+Passing either a specific PLY or a regular ObjSplat scene directory is supported;
+the live matrix does not require `moods.json` or precomputed retexturing.
 
 ## Useful Settings
 

@@ -1,0 +1,90 @@
+experiment_name: layered_vs_monolithic_six_scenes
+output_root: benchmark_results
+python_executable: /opt/anaconda3/envs/layerpano3d/bin/python
+
+# Preprocessing is held fixed. Each run trains fresh PLYs in an isolated scene
+# directory while reusing the exact depth, masks, point clouds and view split.
+scenes:
+  - name: indoor_1
+    scene_root: benchmark_work/comparison_standard/indoor_1
+    shared_preprocessing_root: benchmark_work/evaluation_main/indoor_1
+    input_panorama: benchmark/evaluation/indoor_1.jpg
+  - name: indoor_2
+    scene_root: benchmark_work/comparison_standard/indoor_2
+    shared_preprocessing_root: benchmark_work/evaluation_main/indoor_2
+    input_panorama: benchmark/evaluation/indoor_2.jpg
+  - name: indoor_3
+    scene_root: benchmark_work/comparison_standard/indoor_3
+    shared_preprocessing_root: benchmark_work/evaluation_main/indoor_3
+    input_panorama: benchmark/evaluation/indoor_3.jpg
+  - name: outdoor_1
+    scene_root: benchmark_work/comparison_standard/outdoor_1
+    shared_preprocessing_root: benchmark_work/evaluation_main/outdoor_1
+    input_panorama: benchmark/evaluation/outdoor_1.jpg
+  - name: outdoor_2
+    scene_root: benchmark_work/comparison_standard/outdoor_2
+    shared_preprocessing_root: benchmark_work/evaluation_main/outdoor_2
+    input_panorama: benchmark/evaluation/outdoor_2.jpg
+  - name: outdoor_3
+    scene_root: benchmark_work/comparison_standard/outdoor_3
+    shared_preprocessing_root: benchmark_work/evaluation_main/outdoor_3
+    input_panorama: benchmark/evaluation/outdoor_3.jpg
+
+rerun_segmentation: false
+retrain: true
+reuse_existing_outputs: true
+reuse_requires_scene_artifacts: true
+run_monolithic_baseline: true
+run_quality_evaluation: true
+run_rendering_benchmark: true
+run_edit_locality: false
+run_mood_evaluation: false
+fail_fast: false
+random_seed: 42
+resource_sampling_interval: 1.0
+
+splits:
+  training_fraction: 0.8
+  evaluation_fraction: 0.2
+
+quality_evaluation:
+  max_side: 512
+
+rendering:
+  width: 512
+  height: 512
+  warmup_frames: 5
+  measured_frames: 30
+  rasterizer: cpp
+
+monolithic:
+  iterations: 1000
+  image_size: 640
+  rasterizer: cpp
+  adaptive_topology: false
+  max_points: 0
+
+pipeline_args:
+  - --device
+  - mps
+  - --quality
+  - standard
+  - --mps_rasterizer
+  - cpp
+  - --max_points
+  - "0"
+  - --downsample_ratio
+  - "1.0"
+  - --training_image_size
+  - "640"
+  - --layer_iterations
+  - "800"
+  - --background_iterations
+  - "1000"
+  - --sky_iterations
+  - "500"
+  - --global_refine_iters
+  - "0"
+  - --min_gaussian_retention
+  - "0.95"
+

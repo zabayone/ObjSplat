@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import numpy as np
 
-from benchmark.metrics.image_metrics import mae
+from benchmark.metrics.image_metrics import _float_image
 
 
 def edit_locality_metrics(before, after, target_mask, change_threshold: float = 1 / 255) -> dict:
-    before = np.asarray(before, dtype=np.float32)
-    after = np.asarray(after, dtype=np.float32)
+    before = _float_image(before)
+    after = _float_image(after)
     if before.shape != after.shape:
         raise ValueError("Before and after images must have the same shape")
-    if before.max(initial=0) > 1 or after.max(initial=0) > 1:
-        before, after = before / 255.0, after / 255.0
     mask = np.asarray(target_mask, dtype=bool)
     if mask.shape != before.shape[:2]:
         raise ValueError("Target mask must match image dimensions")

@@ -14,11 +14,11 @@ from benchmark.instrumentation.resources import memory_snapshot
 
 PACKAGES = [
     "numpy", "Pillow", "plyfile", "psutil", "PyYAML", "matplotlib", "pandas",
-    "scikit-image", "torch", "mlx", "mlx-gs", "transformers", "diffusers",
+    "scikit-image", "lpips", "torch", "mlx", "mlx-gs", "transformers", "diffusers",
 ]
 ENV_PREFIXES = (
     "OBJSPLAT_", "MLX_", "PYTORCH_", "TOKENIZERS_", "OMP_", "VECLIB_",
-    "GROUNDING_", "SKY_", "MPS_", "METAL_", "CUDA_",
+    "GROUNDING_", "SKY_", "SPLAT_", "MPS_", "METAL_", "CUDA_",
 )
 
 

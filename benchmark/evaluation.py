@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import time
-from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +10,7 @@ from PIL import Image
 from benchmark.io_utils import read_csv, write_csv
 from benchmark.metrics.image_metrics import absolute_error_visualization, lpips_score, mae, psnr, ssim
 from benchmark.rendering import MLXSceneRenderer
+from benchmark.validation import validate_view_split
 from benchmark.schemas import RECONSTRUCTION_COLUMNS, RENDERING_COLUMNS
 
 
@@ -24,10 +24,11 @@ def evaluation_indices(scene_root: Path) -> tuple[list[int], str]:
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     split = metadata.get("benchmark_view_split") or {}
     indices = [int(value) for value in split.get("evaluation_indices", [])]
+    if indices:
+        validate_view_split(scene_root)
     return indices, "held_out" if indices else "unavailable_not_held_out"
 
 
-@lru_cache(maxsize=8)
 def _scene_evaluation_context(scene_root_value: str):
     scene_root = Path(scene_root_value)
     metadata = json.loads(
@@ -57,8 +58,7 @@ def _scene_evaluation_context(scene_root_value: str):
     return metadata, object_union
 
 
-@lru_cache(maxsize=128)
-def _evaluation_frame(scene_root_value: str, index: int, max_side: int):
+def _evaluation_frame(scene_root_value: str, index: int, max_side: int, scene_context=None):
     scene_root = Path(scene_root_value)
     frame_dir = scene_root / "traindata" / "perspective_frames" / "frames"
     rgb_path = frame_dir / f"rgb_{index}.png"
@@ -75,7 +75,7 @@ def _evaluation_frame(scene_root_value: str, index: int, max_side: int):
         reference = np.asarray(
             reference_image.resize(size, Image.Resampling.LANCZOS)
         )
-    metadata, object_union = _scene_evaluation_context(scene_root_value)
+    metadata, object_union = scene_context or _scene_evaluation_context(scene_root_value)
     foreground_mask = None
     if object_union is not None:
         try:
@@ -102,18 +102,22 @@ def evaluate_reconstruction(
     scene_root, output_dir = Path(scene_root), Path(output_dir)
     indices, split_status = evaluation_indices(scene_root)
     if not indices:
-        return [{
+        rows = [{
             **context, "variant": variant, "view_id": None, "split": split_status,
             "status": "unavailable",
             "note": "No views were excluded from training; post-hoc training-view scores are intentionally not reported.",
         }]
+        metrics_path = output_dir / "reconstruction_metrics.csv"
+        write_csv(metrics_path, read_csv(metrics_path) + rows, RECONSTRUCTION_COLUMNS)
+        return rows
     renderer = MLXSceneRenderer(ply_path, rasterizer=rasterizer)
     image_dir = output_dir / "images" / "reconstruction" / variant
     image_dir.mkdir(parents=True, exist_ok=True)
     rows = []
     scene_cache_key = str(scene_root.resolve())
+    scene_context = _scene_evaluation_context(scene_cache_key)
     for index in indices:
-        frame = _evaluation_frame(scene_cache_key, index, int(max_side))
+        frame = _evaluation_frame(scene_cache_key, index, int(max_side), scene_context)
         if frame is None:
             rows.append({**context, "variant": variant, "view_id": index, "split": "held_out",
                          "status": "failed", "note": "Missing evaluation RGB or pose"})
